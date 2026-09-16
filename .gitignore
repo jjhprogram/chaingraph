@@ -1,0 +1,8 @@
+# build outputs (make)
+/build/
+
+# end-to-end test outputs (sudo tests/run_tests.sh)
+/tests/out/
+
+__pycache__/
+*.pyc

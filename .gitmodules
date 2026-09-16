@@ -1,0 +1,6 @@
+[submodule "libbpf"]
+	path = libbpf
+	url = https://github.com/libbpf/libbpf
+[submodule "FlameGraph"]
+	path = FlameGraph
+	url = https://github.com/brendangregg/FlameGraph
