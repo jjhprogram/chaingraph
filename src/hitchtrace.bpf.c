@@ -57,6 +57,12 @@ const volatile __u64 budget_ns = 16667000;
 const volatile __u64 min_stall_ns = 100000;
 const volatile __u32 max_hops = HT_MAX_HOPS;
 const volatile bool kernel_stacks = true;
+/*
+ * Set by userspace after the present-end marker is attached. Without it the
+ * present bracket never closes, so a frame would look permanently inside
+ * present; better to leave the bucket empty than to mislabel every wait.
+ */
+bool have_present_marker = false;
 const volatile bool user_stacks = false;
 
 /* What we knew about a waker when it issued the wakeup. */
@@ -90,6 +96,7 @@ struct task_state {
 	__u32 seq;		/* odd while links[] is being rewritten */
 	__u32 slot1;		/* per-thread record slot, 1-based; 0 = none */
 	__u32 sysclass;		/* HT_SC_*, while inside a syscall */
+	__u32 in_present;	/* between the present markers */
 	__u32 gpu_depth;	/* nested GPU fence waits */
 	__u64 fault_start;	/* on-CPU kernel stalls, cumulative */
 	__u64 fault_ns;
@@ -720,6 +727,13 @@ int BPF_PROG(on_wakeup_new, struct task_struct *p)
 static __always_inline __u32 blocked_cause(struct task_state *ts, bool irq_waker,
 					   bool woken)
 {
+	/*
+	 * Waiting inside present is the display pacing the app (vsync, swapchain
+	 * back-pressure), not the app stalling; it comes first so a FIFO wait
+	 * that blocks on a fence is not reported as a GPU stall.
+	 */
+	if (ts->in_present)
+		return HT_BLOCK_PRESENT;
 	if (ts->gpu_depth)
 		return HT_BLOCK_GPU;
 	if (ts->out_iowait)
@@ -1117,6 +1131,14 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 		}
 	}
 
+	/*
+	 * The mark is present entry: the frame that just closed ends here, and
+	 * the time until the present-end marker belongs to the frame now
+	 * opening, as the display holding the app back rather than as a stall.
+	 */
+	if (have_present_marker)
+		ts->in_present = 1;
+
 	/* open the next frame, and publish it to the other threads */
 	if (fc) {
 		fc->frame_start = now;
@@ -1136,6 +1158,21 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 	ts->in_ts = now;
 	__builtin_memset(ts->cause_ns, 0, sizeof(ts->cause_ns));
 	__builtin_memset(&ts->worst, 0, sizeof(ts->worst));
+	return 0;
+}
+
+/* Present returned: the app is back in its own frame. */
+SEC("uprobe")
+int BPF_UPROBE(on_present_end, unsigned long frame_id)
+{
+	struct task_struct *cur = bpf_get_current_task_btf();
+	struct task_state *ts;
+
+	if (!in_target(cur))
+		return 0;
+	ts = bpf_task_storage_get(&task_states, cur, NULL, 0);
+	if (ts)
+		ts->in_present = 0;
 	return 0;
 }
 

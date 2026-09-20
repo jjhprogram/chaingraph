@@ -35,6 +35,7 @@
 #include "syms.h"
 
 #define DEFAULT_MARKER		"hitch_frame_mark"
+#define DEFAULT_PRESENT_MARKER	"hitch_present_end"
 #define DEFAULT_BUDGET_US	16667
 #define DEFAULT_MIN_STALL_US	100
 #define POLL_TIMEOUT_MS		100
@@ -48,6 +49,7 @@ static struct env {
 	__u64 min_stall_us;
 	const char *binary;
 	const char *marker;
+	const char *present_marker;
 	const char *jsonl;
 	int hops;
 	long duration;
@@ -58,6 +60,7 @@ static struct env {
 	.budget_us = DEFAULT_BUDGET_US,
 	.min_stall_us = DEFAULT_MIN_STALL_US,
 	.marker = DEFAULT_MARKER,
+	.present_marker = DEFAULT_PRESENT_MARKER,
 	.hops = HT_MAX_HOPS,
 };
 
@@ -87,6 +90,10 @@ static const struct argp_option opts[] = {
 	  "Binary holding the marker symbol (default /proc/PID/exe)", 0 },
 	{ "marker", 'm', "SYMBOL", 0,
 	  "Frame marker symbol to probe (default " DEFAULT_MARKER ")", 0 },
+	{ "present-marker", 'M', "SYMBOL", 0,
+	  "Present-return marker; time between it and the frame marker is the "
+	  "display pacing the app (default " DEFAULT_PRESENT_MARKER
+	  ", \"\" to disable)", 0 },
 	{ "jsonl", 'o', "FILE", 0, "Also append one JSON object per hitch to FILE", 0 },
 	{ "duration", 'd', "SECONDS", 0,
 	  "Stop after this many seconds (default: until Ctrl-C or target exit)", 0 },
@@ -143,6 +150,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case 'm':
 		env.marker = arg;
+		break;
+	case 'M':
+		env.present_marker = arg;
 		break;
 	case 'o':
 		env.jsonl = arg;
@@ -1326,7 +1336,7 @@ int main(int argc, char **argv)
 	};
 	struct hitchtrace_bpf *obj = NULL;
 	struct bpf_program *enter, *leave;
-	struct bpf_link *frame_link = NULL;
+	struct bpf_link *frame_link = NULL, *present_link = NULL;
 	struct ring_buffer *rb = NULL;
 	struct btf *vmlinux_btf;
 	const char *binary;
@@ -1451,6 +1461,28 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
+	/*
+	 * The present-return marker first, so the bracket can never be opened
+	 * without a probe able to close it: the BPF side only starts marking
+	 * present time once we tell it the probe is there.
+	 */
+	if (env.present_marker && env.present_marker[0]) {
+		LIBBPF_OPTS(bpf_uprobe_opts, popts,
+			    .retprobe = false,
+			    .func_name = env.present_marker);
+
+		present_link = bpf_program__attach_uprobe_opts(obj->progs.on_present_end,
+							       env.tgid, binary, 0,
+							       &popts);
+		if (present_link) {
+			obj->bss->have_present_marker = true;
+		} else if (!env.quiet) {
+			fprintf(stderr, "note: %s() not found in %s; time inside "
+				"present will be named by what it blocked in "
+				"instead\n", env.present_marker, binary);
+		}
+	}
+
 	/* the marker goes last: no frame opens before the scheduler hooks live */
 	{
 		LIBBPF_OPTS(bpf_uprobe_opts, uopts,
@@ -1515,6 +1547,8 @@ int main(int argc, char **argv)
 	/* stop new frames, then drain what the kernel already emitted */
 	bpf_link__destroy(frame_link);
 	frame_link = NULL;
+	bpf_link__destroy(present_link);
+	present_link = NULL;
 	ring_buffer__consume(rb);
 	hitchtrace_bpf__detach(obj);
 	for (size_t i = 0; i < sizeof(irq_hooks) / sizeof(irq_hooks[0]); i++) {
@@ -1529,6 +1563,7 @@ int main(int argc, char **argv)
 
 cleanup:
 	bpf_link__destroy(frame_link);
+	bpf_link__destroy(present_link);
 	for (size_t i = 0; i < sizeof(irq_hooks) / sizeof(irq_hooks[0]); i++) {
 		bpf_link__destroy(irq_hooks[i].enter_link);
 		bpf_link__destroy(irq_hooks[i].leave_link);
