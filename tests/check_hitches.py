@@ -1,0 +1,914 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
+"""Assertions over hitchtrace records, joined to hitchbench ground truth.
+
+Two JSONL inputs.
+
+GROUND TRUTH (hitchbench), one object per frame it ran:
+
+  {"frame_id": 412, "injected": "worker_block", "expect": "HT_BLOCK_TASK",
+   "frame_us": 24000, "t_end_ns": 5123456789, "root_tid": 4242}
+
+"injected" is null on a frame with no injection, and "expect" is then null
+or absent. "frame_us" may be spelled "frame_ns".
+
+RECORDS (hitchtrace), one object per over-budget frame: a JSON rendering of
+struct ht_record (src/hitchtrace.h).
+
+  {"frame_id": 412, "root_pid": 4242, "root_tgid": 4200, "root_comm": "hb_root",
+   "frame_start_ns": 5099456789, "frame_end_ns": 5123456789,
+   "frame_ns": 24000000, "budget_ns": 16667000, "nstalls": 3, "flags": [],
+   "cause_ns": {"oncpu": 4000000, "runnable": 0, "runqueue": 0,
+                "block_task": 20000000, "block_io": 0, "block_timer": 0,
+                "block_other": 0,
+                "resolved_wait_oncpu": 2000000, "resolved_inherited": 18000000},
+   "worst": {"ns": 19000000, "start_ns": 5103456789, "cause": "block_task",
+             "kstack_id": 7, "ustack_id": -1,
+             "hops": [{"pid": 4243, "tgid": 4200, "comm": "hb_worker",
+                       "ns": 18000000, "cause": "block_io", "flags": [],
+                       "kstack_id": 9}]}}
+
+Both writers add fields this checker does not look at (hitchbench's
+"expect_resolved" and "note", hitchtrace's stacks and "blocked_in"); they are
+ignored, as is any object without a "frame_id" (a header or a stats line).
+
+Spellings that are accepted anywhere a bucket is named: with or without the
+HT_ prefix, any case ("HT_BLOCK_TASK", "block_task"), plus "inherited" and
+"wait_oncpu" for the two HT_RESOLVED_* buckets. "cause_ns" may also be a
+JSON array in enum order (7 or HT_CAUSE_MAX entries), "flags" may be the
+HT_HOP_*/HT_FRAME_* bitmask instead of a list of names, and a "cause" of
+"unknown" reads as no cause at all.
+
+Subcommands (exit status 0 = pass, 1 = check failed, 2 = usage/IO error):
+
+  join GT.jsonl HITCH.jsonl [--verbose]
+      Per injector class: how many frames were injected, how many produced a
+      record, and how many of those name the class's expected bucket as the
+      largest partition bucket. Prints a table; never fails.
+
+  expect GT.jsonl HITCH.jsonl --class C --bucket B [--resolved R]
+         [--chain comm1,comm2,...] [--min-frac F] [--min-frames N]
+      Fail unless at least N frames injected with class C have a record
+      whose largest partition bucket is B, carrying at least F of the
+      frame's excess (frame_ns - budget_ns), whose HT_BLOCK_TASK time is
+      dominated by the HT_RESOLVED_<R> bucket if --resolved is given, and
+      whose worst stall's hops match --chain in order (substring per hop,
+      "*" matches any hop; an interrupt hop also answers to "[hardirq]",
+      "[softirq]", "[irqexit]", an idle waker to "[idle]").
+
+  quiet GT.jsonl HITCH.jsonl [--max-false N] [--budget-us U]
+      Fail if more than N frames with injected=null produced a record. Also
+      reports how many uninjected frames the ground truth itself puts over
+      budget, which is the noise floor the gate cannot be blamed for.
+
+  invariant HITCH.jsonl [--tol-us T]
+      Fail if a record's partition buckets (HT_ONCPU..HT_BLOCK_OTHER) do not
+      sum to frame_ns within T, or if HT_RESOLVED_WAIT_ONCPU +
+      HT_RESOLVED_INHERITED exceeds HT_BLOCK_TASK by more than T.
+
+Any FILE may be "-" for stdin.
+"""
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+# enum ht_cause, in order. The first PARTITION entries sum to frame_ns; the
+# two HT_RESOLVED_* buckets split HT_BLOCK_TASK and are reported separately.
+BUCKETS = ("oncpu", "runnable", "runqueue", "block_task", "block_io",
+           "block_timer", "block_other",
+           "resolved_wait_oncpu", "resolved_inherited")
+PARTITION = 7
+IDX = {name: i for i, name in enumerate(BUCKETS)}
+BLOCK_TASK = IDX["block_task"]
+WAIT_ONCPU = IDX["resolved_wait_oncpu"]
+INHERITED = IDX["resolved_inherited"]
+
+BUCKET_ALIASES = {
+    "wait_oncpu": "resolved_wait_oncpu",
+    "waitoncpu": "resolved_wait_oncpu",
+    "inherited": "resolved_inherited",
+    "resolved_waker_oncpu": "resolved_wait_oncpu",
+    "cause_partition": "resolved_wait_oncpu",	# HT_CAUSE_PARTITION aliases it
+}
+
+# HT_HOP_* bits, and the label an interrupt hop answers to in --chain.
+HOP_FLAG_BITS = ((1 << 0, "irq"), (1 << 1, "softirq"), (1 << 2, "irqexit"),
+                 (1 << 3, "idle"), (1 << 4, "oncpu"), (1 << 5, "trunc"),
+                 (1 << 6, "stale"))
+HOP_TAGS = (("irq", "[hardirq]"), ("softirq", "[softirq]"),
+            ("irqexit", "[irqexit]"), ("idle", "[idle]"))
+# HT_FRAME_* bits.
+FRAME_FLAG_BITS = ((1 << 0, "open_stall"), (1 << 1, "no_root_state"),
+                   (1 << 2, "lost"))
+
+# A --resolved bucket must hold at least this much of HT_BLOCK_TASK.
+RESOLVED_MIN_FRAC = 0.5
+DIAG_TOP = 5			# offending frames printed per failure
+NO_CLASS = "(none)"		# stands in for injected=null in the join table
+
+
+class ParseError(Exception):
+    """An input line does not hold what this checker was told to expect."""
+
+
+# --------------------------------------------------------------------------
+# value normalization
+
+
+def normalize_bucket(value) -> str:
+    """Canonical bucket name for an enum index, an enum name or a short name.
+
+    Raises ValueError for anything else, including the "unknown" hitchtrace
+    prints for a cause outside enum ht_cause; callers that can live without
+    a cause use optional_bucket().
+    """
+    if isinstance(value, bool):
+        raise ValueError("%r is not a bucket" % (value,))
+    if isinstance(value, int):
+        if 0 <= value < len(BUCKETS):
+            return BUCKETS[value]
+        raise ValueError("bucket index %d is out of range" % value)
+    if not isinstance(value, str):
+        raise ValueError("%r is not a bucket" % (value,))
+    name = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if name.startswith("ht_"):
+        name = name[3:]
+    name = BUCKET_ALIASES.get(name, name)
+    if name not in IDX:
+        raise ValueError("unknown bucket %r (known: %s)"
+                         % (value, ", ".join(BUCKETS)))
+    return name
+
+
+def optional_bucket(value) -> Optional[str]:
+    """Like normalize_bucket(), but None for a missing or unknown cause."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in ("", "unknown", "-"):
+        return None
+    return normalize_bucket(value)
+
+
+def enum_name(bucket: str) -> str:
+    return "HT_" + bucket.upper()
+
+
+def normalize_flags(value, bits) -> Set[str]:
+    """Flag names from a bitmask, a list of names, or a mapping to booleans."""
+    if value is None:
+        return set()
+    if isinstance(value, bool):
+        raise ValueError("%r is not a flag set" % (value,))
+    if isinstance(value, int):
+        return {name for bit, name in bits if value & bit}
+    if isinstance(value, dict):
+        value = [k for k, v in value.items() if v]
+    if isinstance(value, str):
+        value = value.split("|")
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("%r is not a flag set" % (value,))
+    out = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("%r is not a flag name" % (item,))
+        name = item.strip().lower()
+        for prefix in ("ht_hop_", "ht_frame_", "ht_"):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                break
+        if name:
+            # A name outside HT_*_FLAG_BITS is kept as it stands: an unknown
+            # flag is information, not a schema error.
+            out.add(name)
+    return out
+
+
+def _as_int(value, what: str) -> int:
+    if isinstance(value, bool) or value is None:
+        raise ValueError("%s: %r is not a number" % (what, value))
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(round(value))
+    raise ValueError("%s: %r is not a number" % (what, value))
+
+
+def _pick(obj: dict, names: Sequence[str]):
+    for name in names:
+        if name in obj and obj[name] is not None:
+            return obj[name]
+    return None
+
+
+def _ns(ns: Optional[int]) -> str:
+    if ns is None:
+        return "?"
+    return "%.3f ms" % (ns / 1e6)
+
+
+def _pct(num: int, den: int) -> str:
+    return "n/a" if not den else "%.1f%%" % (100.0 * num / den)
+
+
+# --------------------------------------------------------------------------
+# input model
+
+
+@dataclass
+class Hop:
+    comm: str = ""
+    pid: Optional[int] = None
+    tgid: Optional[int] = None
+    ns: Optional[int] = None
+    cause: Optional[str] = None
+    flags: Set[str] = field(default_factory=set)
+
+    def labels(self) -> List[str]:
+        """Everything this hop answers to in a --chain pattern."""
+        out = [self.comm] if self.comm else []
+        out += [tag for flag, tag in HOP_TAGS if flag in self.flags]
+        return out
+
+    def describe(self) -> str:
+        who = self.comm or "?"
+        if self.pid is not None:
+            who += "/%d" % self.pid
+        extra = [tag for flag, tag in HOP_TAGS if flag in self.flags]
+        if extra:
+            who += " " + " ".join(extra)
+        return "%s(%s, %s)" % (who, self.cause or "?", _ns(self.ns))
+
+
+@dataclass
+class Record:
+    lineno: int
+    frame_id: int
+    frame_ns: int
+    budget_ns: int
+    cause_ns: List[int]
+    worst_ns: Optional[int] = None
+    worst_cause: Optional[str] = None
+    hops: List[Hop] = field(default_factory=list)
+    flags: Set[str] = field(default_factory=set)
+    root_comm: str = ""
+    root_pid: Optional[int] = None
+    nstalls: Optional[int] = None
+
+    def bucket(self, name: str) -> int:
+        return self.cause_ns[IDX[name]]
+
+    @property
+    def excess_ns(self) -> int:
+        return self.frame_ns - self.budget_ns
+
+    def largest(self) -> str:
+        """The largest partition bucket; ties go to the lowest enum index."""
+        best = 0
+        for i in range(1, PARTITION):
+            if self.cause_ns[i] > self.cause_ns[best]:
+                best = i
+        return BUCKETS[best]
+
+    def describe(self) -> List[str]:
+        head = ("frame %d: frame_ns %s, budget %s, excess %s, root %s%s"
+                % (self.frame_id, _ns(self.frame_ns), _ns(self.budget_ns),
+                   _ns(self.excess_ns), self.root_comm or "?",
+                   "/%d" % self.root_pid if self.root_pid is not None else ""))
+        if self.flags:
+            head += ", flags %s" % ",".join(sorted(self.flags))
+        head += " (line %d)" % self.lineno
+        part = ["%s %s" % (BUCKETS[i], _ns(self.cause_ns[i]))
+                for i in range(PARTITION) if self.cause_ns[i]]
+        resolved = ["%s %s" % (BUCKETS[i], _ns(self.cause_ns[i]))
+                    for i in (WAIT_ONCPU, INHERITED) if self.cause_ns[i]]
+        out = [head,
+               "  buckets: %s" % ("  ".join(part) if part else "(all zero)")]
+        if resolved:
+            out.append("  resolved: %s" % "  ".join(resolved))
+        worst = "  worst: %s %s" % (self.worst_cause or "?", _ns(self.worst_ns))
+        worst += "; hops: %s" % (" <- ".join(h.describe() for h in self.hops)
+                                 if self.hops else "(none)")
+        out.append(worst)
+        return out
+
+
+@dataclass
+class Frame:
+    """One ground-truth frame."""
+    lineno: int
+    frame_id: int
+    injected: Optional[str] = None
+    expect: Optional[str] = None
+    frame_ns: Optional[int] = None
+    t_end_ns: Optional[int] = None
+    root_tid: Optional[int] = None
+
+
+# --------------------------------------------------------------------------
+# parsing
+
+
+def _parse_jsonl(stream, path: str) -> List[Tuple[int, dict]]:
+    items = []
+    for lineno, line in enumerate(stream, 1):
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        try:
+            obj = json.loads(text)
+        except ValueError as e:
+            raise ParseError("%s:%d: not JSON: %s" % (path, lineno, e))
+        if not isinstance(obj, dict):
+            raise ParseError("%s:%d: expected a JSON object, got %s"
+                             % (path, lineno, type(obj).__name__))
+        items.append((lineno, obj))
+    return items
+
+
+def read_jsonl(path: str) -> List[Tuple[int, dict]]:
+    if path == "-":
+        return _parse_jsonl(sys.stdin, "<stdin>")
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return _parse_jsonl(f, path)
+
+
+def parse_cause_ns(value, where: str) -> List[int]:
+    out = [0] * len(BUCKETS)
+    if isinstance(value, (list, tuple)):
+        if len(value) not in (PARTITION, len(BUCKETS)):
+            raise ParseError("%s: cause_ns has %d entries, expected %d or %d"
+                             % (where, len(value), PARTITION, len(BUCKETS)))
+        for i, item in enumerate(value):
+            out[i] = _as_int(item, "%s: cause_ns[%d]" % (where, i))
+        return out
+    if not isinstance(value, dict):
+        raise ParseError("%s: cause_ns is %s, expected an object or an array"
+                         % (where, type(value).__name__))
+    for key, item in value.items():
+        try:
+            name = normalize_bucket(key)
+        except ValueError as e:
+            raise ParseError("%s: cause_ns: %s" % (where, e))
+        out[IDX[name]] = _as_int(item, "%s: cause_ns[%s]" % (where, name))
+    return out
+
+
+def parse_hop(obj, where: str) -> Hop:
+    if not isinstance(obj, dict):
+        raise ParseError("%s: hop is %s, expected an object"
+                         % (where, type(obj).__name__))
+    try:
+        cause = optional_bucket(_pick(obj, ("cause", "stall", "state")))
+    except ValueError as e:
+        raise ParseError("%s: hop cause: %s" % (where, e))
+    try:
+        flags = normalize_flags(_pick(obj, ("flags",)), HOP_FLAG_BITS)
+    except ValueError as e:
+        raise ParseError("%s: hop flags: %s" % (where, e))
+    ns = _pick(obj, ("ns", "time_ns"))
+    pid = _pick(obj, ("pid", "tid"))
+    tgid = _pick(obj, ("tgid", "pid_tgid"))
+    comm = _pick(obj, ("comm", "name", "label"))
+    return Hop(comm=comm if isinstance(comm, str) else "",
+               pid=None if pid is None else _as_int(pid, "%s: hop pid" % where),
+               tgid=None if tgid is None else _as_int(tgid, "%s: hop tgid" % where),
+               ns=None if ns is None else _as_int(ns, "%s: hop ns" % where),
+               cause=cause, flags=flags)
+
+
+def parse_record(obj: dict, lineno: int, path: str) -> Record:
+    where = "%s:%d" % (path, lineno)
+    if "cause_ns" not in obj and "totals_ns" not in obj and "causes" not in obj:
+        if "injected" in obj or "frame_us" in obj:
+            raise ParseError("%s: this looks like a ground-truth frame, not a "
+                             "hitchtrace record (arguments swapped?)" % where)
+        raise ParseError("%s: record has no cause_ns" % where)
+
+    frame_id = _as_int(_pick(obj, ("frame_id", "frame")), "%s: frame_id" % where)
+    start = _pick(obj, ("frame_start_ns", "t_start_ns"))
+    end = _pick(obj, ("frame_end_ns", "t_end_ns"))
+    frame_ns = _pick(obj, ("frame_ns",))
+    if frame_ns is None and _pick(obj, ("frame_us",)) is not None:
+        frame_ns = _as_int(obj["frame_us"], "%s: frame_us" % where) * 1000
+    if frame_ns is None and start is not None and end is not None:
+        frame_ns = (_as_int(end, "%s: frame_end_ns" % where) -
+                    _as_int(start, "%s: frame_start_ns" % where))
+    if frame_ns is None:
+        raise ParseError("%s: record has no frame_ns" % where)
+    budget = _pick(obj, ("budget_ns",))
+    if budget is None and _pick(obj, ("budget_us",)) is not None:
+        budget = _as_int(obj["budget_us"], "%s: budget_us" % where) * 1000
+    if budget is None:
+        raise ParseError("%s: record has no budget_ns" % where)
+
+    cause_ns = parse_cause_ns(_pick(obj, ("cause_ns", "totals_ns", "causes")), where)
+    try:
+        flags = normalize_flags(_pick(obj, ("flags",)), FRAME_FLAG_BITS)
+    except ValueError as e:
+        raise ParseError("%s: flags: %s" % (where, e))
+
+    worst = _pick(obj, ("worst", "worst_stall", "stall", "largest"))
+    worst_ns = worst_cause = None
+    hops_raw = _pick(obj, ("hops",))
+    if worst is not None:
+        if not isinstance(worst, dict):
+            raise ParseError("%s: worst is %s, expected an object"
+                             % (where, type(worst).__name__))
+        if _pick(worst, ("ns",)) is not None:
+            worst_ns = _as_int(worst["ns"], "%s: worst.ns" % where)
+        try:
+            worst_cause = optional_bucket(_pick(worst, ("cause",)))
+        except ValueError as e:
+            raise ParseError("%s: worst.cause: %s" % (where, e))
+        if hops_raw is None:
+            hops_raw = _pick(worst, ("hops", "chain"))
+    hops = []
+    if hops_raw is not None:
+        if not isinstance(hops_raw, (list, tuple)):
+            raise ParseError("%s: hops is %s, expected an array"
+                             % (where, type(hops_raw).__name__))
+        hops = [parse_hop(h, where) for h in hops_raw]
+
+    root_pid = _pick(obj, ("root_pid", "root_tid", "tid"))
+    root_comm = _pick(obj, ("root_comm", "comm"))
+    nstalls = _pick(obj, ("nstalls",))
+    return Record(lineno=lineno, frame_id=frame_id, frame_ns=frame_ns,
+                  budget_ns=budget, cause_ns=cause_ns, worst_ns=worst_ns,
+                  worst_cause=worst_cause, hops=hops, flags=flags,
+                  root_comm=root_comm if isinstance(root_comm, str) else "",
+                  root_pid=(None if root_pid is None
+                            else _as_int(root_pid, "%s: root_pid" % where)),
+                  nstalls=(None if nstalls is None
+                           else _as_int(nstalls, "%s: nstalls" % where)))
+
+
+def parse_frame(obj: dict, lineno: int, path: str) -> Frame:
+    where = "%s:%d" % (path, lineno)
+    if "cause_ns" in obj:
+        raise ParseError("%s: this looks like a hitchtrace record, not a "
+                         "ground-truth frame (arguments swapped?)" % where)
+    frame_id = _as_int(_pick(obj, ("frame_id", "frame")), "%s: frame_id" % where)
+    injected = obj.get("injected")
+    if injected is not None and not isinstance(injected, str):
+        raise ParseError("%s: injected is %s, expected a string or null"
+                         % (where, type(injected).__name__))
+    expect = obj.get("expect")
+    if expect is not None:
+        if isinstance(expect, dict):		# {"bucket": "HT_..."} form
+            expect = _pick(expect, ("bucket", "cause"))
+        try:
+            expect = optional_bucket(expect)
+        except ValueError as e:
+            raise ParseError("%s: expect: %s" % (where, e))
+    frame_ns = _pick(obj, ("frame_ns",))
+    if frame_ns is None and _pick(obj, ("frame_us",)) is not None:
+        frame_ns = _as_int(obj["frame_us"], "%s: frame_us" % where) * 1000
+    elif frame_ns is not None:
+        frame_ns = _as_int(frame_ns, "%s: frame_ns" % where)
+    t_end = _pick(obj, ("t_end_ns", "frame_end_ns"))
+    root_tid = _pick(obj, ("root_tid", "root_pid", "tid"))
+    return Frame(lineno=lineno, frame_id=frame_id, injected=injected,
+                 expect=expect, frame_ns=frame_ns,
+                 t_end_ns=(None if t_end is None
+                           else _as_int(t_end, "%s: t_end_ns" % where)),
+                 root_tid=(None if root_tid is None
+                           else _as_int(root_tid, "%s: root_tid" % where)))
+
+
+def read_records(path: str) -> Tuple[List[Record], int]:
+    """Records plus the number of non-record (header/stats) objects skipped."""
+    items = read_jsonl(path)
+    records, skipped = [], 0
+    for lineno, obj in items:
+        if _pick(obj, ("frame_id", "frame")) is None:
+            skipped += 1
+            continue
+        records.append(parse_record(obj, lineno, path))
+    return records, skipped
+
+
+def read_window(path: str) -> Tuple[Optional[int], Optional[int]]:
+    """The tracing window, from hitchtrace's header/summary lines (if any)."""
+    start = end = None
+    for _, obj in read_jsonl(path):
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("trace_start_ns") is not None:
+            start = _as_int(obj["trace_start_ns"], "trace_start_ns")
+        if obj.get("trace_end_ns") is not None:
+            end = _as_int(obj["trace_end_ns"], "trace_end_ns")
+    return start, end
+
+
+def in_window(frames: Sequence[Frame], start: Optional[int],
+              end: Optional[int]) -> List[Frame]:
+    """Ground-truth frames that ended while tracing was running.
+
+    Frames outside the window were never offered to the tool, so counting
+    them as misses would understate it.
+    """
+    if start is None and end is None:
+        return list(frames)
+    kept = []
+    for f in frames:
+        if f.t_end_ns is None:
+            kept.append(f)
+            continue
+        if start is not None and f.t_end_ns < start:
+            continue
+        if end is not None and f.t_end_ns > end:
+            continue
+        kept.append(f)
+    return kept
+
+
+def read_ground_truth(path: str) -> Tuple[List[Frame], int]:
+    items = read_jsonl(path)
+    frames, skipped = [], 0
+    for lineno, obj in items:
+        if _pick(obj, ("frame_id", "frame")) is None:
+            skipped += 1
+            continue
+        frames.append(parse_frame(obj, lineno, path))
+    return frames, skipped
+
+
+def index_records(records: Sequence[Record]) -> Tuple[Dict[int, Record], List[int]]:
+    """Map frame_id -> record (first wins), plus the duplicated frame_ids."""
+    by_id: Dict[int, Record] = {}
+    dups: List[int] = []
+    for rec in records:
+        if rec.frame_id in by_id:
+            dups.append(rec.frame_id)
+        else:
+            by_id[rec.frame_id] = rec
+    return by_id, dups
+
+
+# --------------------------------------------------------------------------
+# checks shared by the subcommands
+
+
+def split_chain(text: str) -> List[str]:
+    return [c for c in (s.strip() for s in text.split(",")) if c] if text else []
+
+
+def match_chain(hops: Sequence[Hop], patterns: Sequence[str]) -> Optional[str]:
+    """None if the hops match, else why they do not."""
+    if len(patterns) > len(hops):
+        return ("chain has %d hop(s) (%s), need %d"
+                % (len(hops), " <- ".join(h.describe() for h in hops) or "none",
+                   len(patterns)))
+    for i, pattern in enumerate(patterns):
+        if pattern == "*":
+            continue
+        want = pattern.lower()
+        if not any(want in label.lower() for label in hops[i].labels()):
+            return "hop %d is %s, expected %r" % (i, hops[i].describe(), pattern)
+    return None
+
+
+def check_frame(rec: Optional[Record], bucket: str, min_frac: float,
+                resolved: Optional[str],
+                chain: Sequence[str]) -> List[Tuple[str, str]]:
+    """(kind, detail) for each way this injected frame is not diagnosed."""
+    if rec is None:
+        return [("no record", "no record for this frame")]
+    reasons = []
+    largest = rec.largest()
+    if largest != bucket:
+        reasons.append(("wrong bucket",
+                        "largest bucket is %s (%s), expected %s"
+                        % (enum_name(largest), _ns(rec.bucket(largest)),
+                           enum_name(bucket))))
+    got = rec.bucket(bucket)
+    excess = rec.excess_ns
+    need = min_frac * excess if excess > 0 else 0.0
+    if got <= 0 or got < need:
+        reasons.append(("below --min-frac",
+                        "%s is %s, needs %s (%.2f of the %s excess)"
+                        % (enum_name(bucket), _ns(got), _ns(int(need)),
+                           min_frac, _ns(excess))))
+    if resolved is not None:
+        block = rec.bucket("block_task")
+        mine = rec.bucket(resolved)
+        other = rec.cause_ns[WAIT_ONCPU if resolved == BUCKETS[INHERITED]
+                             else INHERITED]
+        if block <= 0:
+            reasons.append(("wrong resolution",
+                            "HT_BLOCK_TASK is zero, nothing to resolve"))
+        elif mine < RESOLVED_MIN_FRAC * block or mine < other:
+            reasons.append(("wrong resolution",
+                            "%s is %s of %s HT_BLOCK_TASK (other resolution %s)"
+                            % (enum_name(resolved), _ns(mine), _ns(block),
+                               _ns(other))))
+    if chain:
+        why = match_chain(rec.hops, chain)
+        if why:
+            reasons.append(("chain mismatch", why))
+    return reasons
+
+
+# --------------------------------------------------------------------------
+# subcommands
+
+
+def cmd_join(frames: Sequence[Frame], records: Sequence[Record],
+             verbose: bool) -> Tuple[bool, List[str]]:
+    by_id, dups = index_records(records)
+    classes: List[str] = []
+    for f in frames:
+        name = f.injected or NO_CLASS
+        if name not in classes:
+            classes.append(name)
+
+    rows = [("class", "expect", "frames", "records", "bucket-hit")]
+    details: List[str] = []
+    for name in classes:
+        sel = [f for f in frames if (f.injected or NO_CLASS) == name]
+        with_rec = [f for f in sel if f.frame_id in by_id]
+        expects = sorted({f.expect for f in sel if f.expect})
+        want = "/".join(enum_name(e) for e in expects) if expects else "-"
+        if expects:
+            hit = [f for f in with_rec
+                   if f.expect and by_id[f.frame_id].largest() == f.expect]
+            hits = "%d (%s)" % (len(hit), _pct(len(hit), len(with_rec)))
+        else:
+            hit = []
+            hits = "-"
+        rows.append((name, want, str(len(sel)),
+                     "%d (%s)" % (len(with_rec), _pct(len(with_rec), len(sel))),
+                     hits))
+        if verbose:
+            details.append("%s: %d frame(s), %d with a record, %d on bucket"
+                           % (name, len(sel), len(with_rec), len(hit)))
+            missing = [f for f in sel if f.frame_id not in by_id]
+            if missing and name != NO_CLASS:
+                details.append("  no record for frame(s): %s%s"
+                               % (", ".join(str(f.frame_id)
+                                            for f in missing[:DIAG_TOP]),
+                                  " ..." if len(missing) > DIAG_TOP else ""))
+            hit_ids = {f.frame_id for f in hit}
+            wrong = [f for f in with_rec if f.frame_id not in hit_ids]
+            for f in wrong[:DIAG_TOP]:
+                details += ["  " + ln for ln in by_id[f.frame_id].describe()]
+
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    out = [" ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip()
+           for row in rows]
+    out.append("%d frame(s), %d record(s)" % (len(frames), len(records)))
+    frame_ids = {f.frame_id for f in frames}
+    unmatched = [r for r in records if r.frame_id not in frame_ids]
+    if unmatched:
+        out.append("%d record(s) for frame_ids absent from the ground truth"
+                   % len(unmatched))
+    if dups:
+        out.append("%d duplicate record frame_id(s): %s"
+                   % (len(dups), ", ".join(str(d) for d in dups[:DIAG_TOP])))
+    return True, out + details
+
+
+def cmd_expect(frames: Sequence[Frame], records: Sequence[Record],
+               cls: str, bucket: str, min_frac: float, min_frames: int,
+               resolved: Optional[str],
+               chain: Sequence[str]) -> Tuple[bool, List[str]]:
+    by_id, _ = index_records(records)
+    sel = [f for f in frames if f.injected == cls]
+    good, bad = [], []
+    for f in sel:
+        rec = by_id.get(f.frame_id)
+        reasons = check_frame(rec, bucket, min_frac, resolved, chain)
+        (good if not reasons else bad).append((f, rec, reasons))
+
+    want = "%s as the largest bucket with >= %.2f of the excess" % (
+        enum_name(bucket), min_frac)
+    if resolved is not None:
+        want += ", resolved %s" % enum_name(resolved)
+    if chain:
+        want += ", chain %s" % " <- ".join(chain)
+    head = ("%d/%d frame(s) injected with %s show %s"
+            % (len(good), len(sel), cls, want))
+    if len(good) >= min_frames and sel:
+        return True, ["ok: " + head + " (need %d)" % min_frames]
+
+    report = ["FAILED expect %s: %s, need %d" % (cls, head, min_frames)]
+    if not sel:
+        report.append("  the ground truth has no frame injected with %r "
+                      "(classes: %s)"
+                      % (cls, ", ".join(sorted({f.injected for f in frames
+                                                if f.injected})) or "none"))
+        return False, report
+    norec = [t for t in bad if t[1] is None]
+    if norec:
+        report.append("  %d of the %d injected frame(s) produced no record "
+                      "(frame_ids %s%s)"
+                      % (len(norec), len(sel),
+                         ", ".join(str(t[0].frame_id) for t in norec[:DIAG_TOP]),
+                         " ..." if len(norec) > DIAG_TOP else ""))
+    counts: Dict[str, int] = {}
+    for _, rec, reasons in bad:
+        if rec is not None:
+            for kind, _detail in reasons:
+                counts[kind] = counts.get(kind, 0) + 1
+    for kind, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        report.append("  %d frame(s): %s" % (n, kind))
+    shown = 0
+    for f, rec, reasons in bad:
+        if rec is None or shown >= DIAG_TOP:
+            continue
+        shown += 1
+        report += ["  " + ln for ln in rec.describe()]
+        report += ["    not diagnosed: %s" % detail for _kind, detail in reasons]
+    return False, report
+
+
+def cmd_quiet(frames: Sequence[Frame], records: Sequence[Record],
+              max_false: int, budget_ns: Optional[int]) -> Tuple[bool, List[str]]:
+    by_id, _ = index_records(records)
+    frame_ids = {f.frame_id for f in frames}
+    clean = [f for f in frames if f.injected is None]
+    noisy = [f for f in clean if f.frame_id in by_id]
+    unmatched = [r for r in records if r.frame_id not in frame_ids]
+
+    if budget_ns is None and records:
+        budget_ns = sorted(r.budget_ns for r in records)[len(records) // 2]
+    over = [f for f in clean
+            if budget_ns and f.frame_ns and f.frame_ns > budget_ns]
+    timed = [f for f in clean if f.frame_ns is not None]
+
+    # A record for an uninjected frame that really did blow the budget is the
+    # gate doing its job, not a false positive: only frames the ground truth
+    # timed within budget count against it.
+    over_ids = {f.frame_id for f in over}
+    honest = [f for f in noisy if f.frame_id in over_ids]
+    noisy = [f for f in noisy if f.frame_id not in over_ids]
+
+    lines = ["%d of %d uninjected frame(s) produced a record for a frame that was "
+             "within budget (%s), at most %d allowed"
+             % (len(noisy), len(clean), _pct(len(noisy), len(clean)), max_false)]
+    if honest:
+        lines.append("%d further record(s) are uninjected frames that the ground "
+                     "truth also puts over budget (the gate was right)"
+                     % len(honest))
+    if budget_ns and timed:
+        lines.append("ground truth: %d of %d uninjected frame(s) were over the "
+                     "%s budget (%s)"
+                     % (len(over), len(timed), _ns(budget_ns),
+                        _pct(len(over), len(timed))))
+    else:
+        lines.append("ground truth: no budget or no frame times available, "
+                     "over-budget-but-uninjected rate unknown")
+    if unmatched:
+        lines.append("note: %d record(s) name a frame_id absent from the ground "
+                     "truth (frame_ids %s)"
+                     % (len(unmatched),
+                        ", ".join(str(r.frame_id) for r in unmatched[:DIAG_TOP])))
+    if len(noisy) <= max_false:
+        return True, ["ok: " + lines[0]] + lines[1:]
+
+    report = ["FAILED quiet: " + lines[0]] + lines[1:]
+    for f in noisy[:DIAG_TOP]:
+        report += ["  " + ln for ln in by_id[f.frame_id].describe()]
+    if len(noisy) > DIAG_TOP:
+        report.append("  ... %d more" % (len(noisy) - DIAG_TOP))
+    return False, report
+
+
+def cmd_invariant(records: Sequence[Record], tol_ns: int) -> Tuple[bool, List[str]]:
+    bad: List[Tuple[Record, List[str]]] = []
+    for rec in records:
+        problems = []
+        total = sum(rec.cause_ns[:PARTITION])
+        if abs(total - rec.frame_ns) > tol_ns:
+            problems.append("partition sums to %s, frame_ns is %s (off by %s, "
+                            "tolerance %s)"
+                            % (_ns(total), _ns(rec.frame_ns),
+                               _ns(abs(total - rec.frame_ns)), _ns(tol_ns)))
+        resolved = rec.cause_ns[WAIT_ONCPU] + rec.cause_ns[INHERITED]
+        block = rec.cause_ns[BLOCK_TASK]
+        if resolved - block > tol_ns:
+            problems.append("resolved %s (wait_oncpu %s + inherited %s) exceeds "
+                            "HT_BLOCK_TASK %s"
+                            % (_ns(resolved), _ns(rec.cause_ns[WAIT_ONCPU]),
+                               _ns(rec.cause_ns[INHERITED]), _ns(block)))
+        if problems:
+            bad.append((rec, problems))
+
+    if not bad:
+        if not records:
+            return True, ["ok: no records to check"]
+        return True, ["ok: %d record(s) partition frame_ns within %s"
+                      % (len(records), _ns(tol_ns))]
+    report = ["FAILED invariant: %d of %d record(s) do not add up"
+              % (len(bad), len(records))]
+    for rec, problems in bad[:DIAG_TOP]:
+        report += ["  " + ln for ln in rec.describe()]
+        report += ["    %s" % p for p in problems]
+    if len(bad) > DIAG_TOP:
+        report.append("  ... %d more" % (len(bad) - DIAG_TOP))
+    return False, report
+
+
+# --------------------------------------------------------------------------
+# CLI
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    j = sub.add_parser("join", help="per-class hit table, for eyeballing a run")
+    j.add_argument("ground_truth")
+    j.add_argument("records")
+    j.add_argument("--verbose", action="store_true",
+                   help="also print the frames that missed")
+
+    e = sub.add_parser("expect", help="assert an injector class is diagnosed")
+    e.add_argument("ground_truth")
+    e.add_argument("records")
+    e.add_argument("--class", dest="cls", required=True,
+                   help="injector class, as the ground truth spells it")
+    e.add_argument("--bucket", required=True,
+                   help="expected largest partition bucket, e.g. HT_BLOCK_TASK")
+    e.add_argument("--resolved", choices=("inherited", "wait_oncpu"),
+                   help="HT_BLOCK_TASK must be dominated by this resolution")
+    e.add_argument("--chain", default="",
+                   help="comma-separated hop comms, direct waker first; "
+                        "substring per hop, '*' matches any hop")
+    e.add_argument("--min-frac", type=float, default=0.5,
+                   help="share of the frame's excess the bucket must carry "
+                        "(default 0.5)")
+    e.add_argument("--min-frames", type=int, default=1,
+                   help="how many injected frames must pass (default 1)")
+
+    q = sub.add_parser("quiet", help="assert the gate ignores normal frames")
+    q.add_argument("ground_truth")
+    q.add_argument("records")
+    q.add_argument("--max-false", type=int, default=0,
+                   help="uninjected frames allowed to produce a record "
+                        "(default 0)")
+    q.add_argument("--budget-us", type=int,
+                   help="frame budget for the ground-truth over-budget rate "
+                        "(default: the median budget_ns of the records)")
+
+    i = sub.add_parser("invariant", help="assert the buckets add up")
+    i.add_argument("records")
+    i.add_argument("--tol-us", type=int, default=500,
+                   help="tolerance in microseconds (default 500)")
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        records, skipped = read_records(args.records)
+        frames: List[Frame] = []
+        if args.cmd != "invariant":
+            frames, _ = read_ground_truth(args.ground_truth)
+            start, end = read_window(args.records)
+            traced = in_window(frames, start, end)
+            if len(traced) != len(frames):
+                print("(ground truth: %d of %d frame(s) fall inside the trace "
+                      "window)" % (len(traced), len(frames)))
+            frames = traced
+        if args.cmd == "expect":
+            try:
+                bucket = normalize_bucket(args.bucket)
+            except ValueError as e:
+                parser.error(str(e))
+            if args.min_frac < 0 or args.min_frac > 1:
+                parser.error("--min-frac must be between 0 and 1")
+            resolved = (None if args.resolved is None
+                        else normalize_bucket(args.resolved))
+            ok, report = cmd_expect(frames, records, args.cls, bucket,
+                                    args.min_frac, args.min_frames, resolved,
+                                    split_chain(args.chain))
+        elif args.cmd == "join":
+            ok, report = cmd_join(frames, records, args.verbose)
+        elif args.cmd == "quiet":
+            budget = None if args.budget_us is None else args.budget_us * 1000
+            ok, report = cmd_quiet(frames, records, args.max_false, budget)
+        else:
+            ok, report = cmd_invariant(records, args.tol_us * 1000)
+    except ParseError as e:
+        print("check_hitches: %s" % e, file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as e:
+        print("check_hitches: %s" % e, file=sys.stderr)
+        return 2
+
+    for line in report:
+        print(line)
+    if skipped:
+        print("(ignored %d non-record line(s) in %s)" % (skipped, args.records))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
