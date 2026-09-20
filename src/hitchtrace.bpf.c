@@ -1,0 +1,594 @@
+// SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
+/*
+ * hitchtrace prototype: frame-scoped, cause-gated stall attribution.
+ *
+ * The root thread is whichever thread of the target process hits the frame
+ * marker (a uprobe). Between two marks, every off-CPU interval of the root
+ * is timed, clipped to the frame window and added to one bucket, so
+ * oncpu + runnable + runqueue + blocked == frame_ns on the root.
+ *
+ * Blocked time is resolved through the wake chain. Every task carries, in
+ * task storage, a snapshot of its waker's most recent off-CPU interval, taken
+ * when the wakeup happened (links[0]), plus the waker's own chain shifted down
+ * (links[1..]). The part of a wait that overlaps the waker's stall is
+ * inherited from it; the rest is the waker running on-CPU, i.e. waiting for
+ * work rather than a kernel stall.
+ *
+ * A record crosses to user space only when frame_ns > budget_ns.
+ */
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+#include "hitchtrace.h"
+
+#define EEXIST		17
+
+#define TASK_RUNNING	0x0000
+#define TASK_DEAD	0x0080
+#define PF_USER_WORKER	0x00004000
+#define PF_KTHREAD	0x00200000
+
+#define SOFTIRQ_OFFSET	0x00000100
+#define HARDIRQ_MASK	0x000f0000
+#define NMI_MASK	0x00f00000
+
+/* Configuration, set by userspace before load (lands in .rodata). */
+const volatile __u32 targ_tgid = 0;
+const volatile __u64 budget_ns = 16667000;
+const volatile __u64 min_stall_ns = 100000;
+const volatile __u32 max_hops = HT_MAX_HOPS;
+const volatile bool kernel_stacks = true;
+const volatile bool user_stacks = false;
+
+/* What we knew about a waker when it issued the wakeup. */
+struct hop_link {
+	__u64 wake_ts;		/* when this wakeup happened */
+	__u64 w_out;		/* waker's last off-CPU interval ... */
+	__u64 w_in;		/* ... as of that moment */
+	__u32 w_cause;		/* enum ht_cause of that interval */
+	__s32 w_kstack;		/* where the waker was blocked, if it was */
+	__u32 pid;
+	__u32 tgid;
+	__u32 flags;		/* HT_HOP_* */
+	__u32 __pad;
+	char comm[TASK_COMM_LEN];
+};
+
+struct task_state {
+	/* scheduling, maintained for every task */
+	__u64 out_ts;		/* switch-out time; 0 while on-CPU */
+	__u64 in_ts;		/* last switch-in time */
+	__u64 wake_ts;		/* wakeup since the last switch-in; 0 if none */
+	__u32 out_state;	/* prev_state at switch-out (0 = preempted) */
+	__u32 out_iowait;	/* in_iowait at switch-out */
+	__s32 out_kstack;	/* stacks captured at switch-out */
+	__s32 out_ustack;
+	__u64 last_out;		/* last completed off-CPU interval ... */
+	__u64 last_in;
+	__u32 last_cause;	/* ... and what it was */
+	__s32 last_kstack;
+	__u32 depth;		/* valid entries in links[] */
+	__u32 seq;		/* odd while links[] is being rewritten */
+	struct hop_link links[HT_MAX_HOPS];
+
+	/* frame accounting, used only by a root thread */
+	bool is_root;
+	__u64 frame_start;
+	__u64 frame_id;
+	__u32 nstalls;
+	__u32 frame_flags;
+	__u64 cause_ns[HT_CAUSE_MAX];
+	struct ht_stall worst;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct task_state);
+} task_states SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_STACK_TRACE);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, HT_PERF_MAX_STACK * sizeof(__u64));
+	__uint(max_entries, 8192);
+} kstacks SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_STACK_TRACE);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, HT_PERF_MAX_STACK * sizeof(__u64));
+	__uint(max_entries, 4096);
+} ustacks SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 8 << 20);
+} events SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} irq_exit_nest SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, HT_STAT_MAX);
+	__type(key, __u32);
+	__type(value, __u64);
+} stats SEC(".maps");
+
+/* Interrupt context, as in chaingraph: the per-CPU preempt count. */
+extern const int __preempt_count __ksym __weak;
+
+struct pcpu_hot___ht {
+	int preempt_count;
+} __attribute__((preserve_access_index));
+
+extern const struct pcpu_hot___ht pcpu_hot __ksym __weak;
+
+static __always_inline int preempt_count(void)
+{
+#if defined(bpf_target_x86)
+	if (bpf_ksym_exists(&__preempt_count))
+		return *(int *)bpf_this_cpu_ptr(&__preempt_count);
+	if (bpf_ksym_exists(&pcpu_hot) &&
+	    bpf_core_field_exists(struct pcpu_hot___ht, preempt_count))
+		return ((struct pcpu_hot___ht *)
+			bpf_this_cpu_ptr(&pcpu_hot))->preempt_count;
+#elif defined(bpf_target_arm64)
+	return bpf_get_current_task_btf()->thread_info.preempt.count;
+#endif
+	return 0;
+}
+
+static __always_inline void stat_inc(__u32 idx)
+{
+	__u64 *v = bpf_map_lookup_elem(&stats, &idx);
+
+	if (v)
+		(*v)++;
+}
+
+static __always_inline __u32 *irq_exit_depth(void)
+{
+	__u32 zero = 0;
+
+	return bpf_map_lookup_elem(&irq_exit_nest, &zero);
+}
+
+SEC("fentry/irq_exit_rcu")
+int BPF_PROG(on_irq_exit_rcu_enter)
+{
+	__u32 *n = irq_exit_depth();
+
+	if (n)
+		(*n)++;
+	return 0;
+}
+
+SEC("fexit/irq_exit_rcu")
+int BPF_PROG(on_irq_exit_rcu_leave)
+{
+	__u32 *n = irq_exit_depth();
+
+	if (n && *n)
+		(*n)--;
+	return 0;
+}
+
+SEC("fentry/irq_exit")
+int BPF_PROG(on_irq_exit_enter)
+{
+	__u32 *n = irq_exit_depth();
+
+	if (n)
+		(*n)++;
+	return 0;
+}
+
+SEC("fexit/irq_exit")
+int BPF_PROG(on_irq_exit_leave)
+{
+	__u32 *n = irq_exit_depth();
+
+	if (n && *n)
+		(*n)--;
+	return 0;
+}
+
+/* Length of [s, e) clipped to [lo, ...). */
+static __always_inline __u64 clip(__u64 s, __u64 e, __u64 lo)
+{
+	if (e <= s || e <= lo)
+		return 0;
+	if (s < lo)
+		s = lo;
+	return e - s;
+}
+
+/* Length of [a0, a1) ∩ [b0, b1). */
+static __always_inline __u64 overlap(__u64 a0, __u64 a1, __u64 b0, __u64 b1)
+{
+	__u64 lo = a0 > b0 ? a0 : b0;
+	__u64 hi = a1 < b1 ? a1 : b1;
+
+	return hi > lo ? hi - lo : 0;
+}
+
+static __always_inline void add_cause(struct task_state *ts, __u32 cause, __u64 ns)
+{
+	if (!ns || cause >= HT_CAUSE_MAX)
+		return;
+	ts->cause_ns[cause] += ns;
+}
+
+static __always_inline __s32 kernel_stack(void *ctx)
+{
+	long id;
+
+	if (!kernel_stacks)
+		return -1;
+	id = bpf_get_stackid(ctx, &kstacks, 0);
+	if (id < 0) {
+		stat_inc(HT_STAT_STACK_ERR);
+		return -1;
+	}
+	return id;
+}
+
+static __always_inline __s32 user_stack(void *ctx, struct task_struct *t)
+{
+	long id;
+
+	if (!user_stacks || (t->flags & (PF_KTHREAD | PF_USER_WORKER)) || !t->mm)
+		return -1;
+	id = bpf_get_stackid(ctx, &ustacks, BPF_F_USER_STACK);
+	if (id < 0) {
+		stat_inc(HT_STAT_STACK_ERR);
+		return -1;
+	}
+	return id;
+}
+
+static __always_inline bool in_target(struct task_struct *t)
+{
+	return targ_tgid && t->tgid == targ_tgid;
+}
+
+/*
+ * @p is being woken by the current task. Record what the waker was doing, so
+ * that @p can later work out how much of its wait the waker explains.
+ */
+static __always_inline int record_wakeup(void *ctx, struct task_struct *p)
+{
+	struct task_struct *waker = bpf_get_current_task_btf();
+	struct task_state *ts, *wts = NULL;
+	struct hop_link *l;
+	__u32 flags = 0, depth = 1;
+	bool interrupt;
+	int pc;
+
+	if (p->pid == waker->pid)
+		return 0;
+
+	ts = bpf_task_storage_get(&task_states, p, NULL,
+				  BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!ts) {
+		stat_inc(HT_STAT_STORAGE_FAIL);
+		return 0;
+	}
+
+	pc = preempt_count();
+	if (pc & (NMI_MASK | HARDIRQ_MASK)) {
+		flags |= HT_HOP_IRQ;
+	} else {
+		__u32 *nest;
+
+		if (pc & SOFTIRQ_OFFSET)
+			flags |= HT_HOP_SOFTIRQ;
+		nest = irq_exit_depth();
+		if (nest && *nest)
+			flags |= HT_HOP_IRQEXIT;
+	}
+	if (waker->pid == 0)
+		flags |= HT_HOP_IDLE;
+
+	/* In interrupt context "current" is only the interrupted task. */
+	interrupt = flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE);
+	if (!interrupt && max_hops > 1)
+		wts = bpf_task_storage_get(&task_states, waker, NULL, 0);
+
+	ts->seq++;
+	if (wts && wts->depth) {
+		__u32 wseq = wts->seq;
+
+		__builtin_memcpy(&ts->links[1], &wts->links[0],
+				 sizeof(struct hop_link) * (HT_MAX_HOPS - 1));
+		if (wts->seq != wseq) {	/* rewritten under us */
+			__builtin_memset(&ts->links[1], 0,
+					 sizeof(struct hop_link) * (HT_MAX_HOPS - 1));
+		} else {
+			__u32 wdepth = wts->depth;
+
+			if (wdepth > HT_MAX_HOPS - 1)
+				wdepth = HT_MAX_HOPS - 1;
+			depth = wdepth + 1;
+			if (depth > max_hops) {
+				depth = max_hops;
+				if (depth >= 1 && depth <= HT_MAX_HOPS)
+					ts->links[depth - 1].flags |= HT_HOP_TRUNC;
+			}
+		}
+	} else {
+		__builtin_memset(&ts->links[1], 0,
+				 sizeof(struct hop_link) * (HT_MAX_HOPS - 1));
+	}
+
+	l = &ts->links[0];
+	__builtin_memset(l, 0, sizeof(*l));
+	l->wake_ts = bpf_ktime_get_ns();
+	l->flags = flags;
+	if (!interrupt) {
+		l->pid = waker->pid;
+		l->tgid = waker->tgid;
+		bpf_get_current_comm(l->comm, sizeof(l->comm));
+		if (wts) {
+			l->w_out = wts->last_out;
+			l->w_in = wts->last_in;
+			l->w_cause = wts->last_cause;
+			l->w_kstack = wts->last_kstack;
+		} else {
+			l->w_kstack = -1;
+		}
+	} else {
+		l->w_kstack = -1;
+	}
+	ts->depth = depth;
+	ts->seq++;
+	ts->wake_ts = l->wake_ts;
+	return 0;
+}
+
+SEC("tp_btf/sched_waking")
+int BPF_PROG(on_waking, struct task_struct *p)
+{
+	return record_wakeup(ctx, p);
+}
+
+SEC("tp_btf/sched_wakeup_new")
+int BPF_PROG(on_wakeup_new, struct task_struct *p)
+{
+	return record_wakeup(ctx, p);
+}
+
+/*
+ * Resolve a blocked interval [lo, hi) of the root through its wake chain and
+ * record it as the frame's worst stall if it is the longest so far.
+ */
+static __always_inline void resolve(struct task_state *ts, __u64 lo, __u64 hi,
+				    __u32 cause, __u64 blocked_ns)
+{
+	struct ht_stall *w = &ts->worst;
+	__u64 prev_out = lo, prev_in = hi, inherited = 0;
+	__u32 i, nhops = 0;
+
+	/*
+	 * links[0] is the waker; how much of the wait does its own stall cover?
+	 * Only a wait ended by another task splits this way: an I/O or timer
+	 * wait was not spent waiting for a thread to get around to us.
+	 */
+	inherited = overlap(lo, hi, ts->links[0].w_out, ts->links[0].w_in);
+	if (ts->links[0].flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE))
+		inherited = 0;
+	if (cause == HT_BLOCK_TASK) {
+		add_cause(ts, HT_RESOLVED_INHERITED, inherited);
+		add_cause(ts, HT_RESOLVED_WAIT_ONCPU,
+			  blocked_ns > inherited ? blocked_ns - inherited : 0);
+		stat_inc(inherited ? HT_STAT_RESOLVED : HT_STAT_UNRESOLVED);
+	}
+
+	if (blocked_ns <= w->ns || blocked_ns < min_stall_ns)
+		return;
+
+	__builtin_memset(w, 0, sizeof(*w));
+	w->ns = blocked_ns;
+	w->start_ns = lo;
+	w->cause = cause;
+	w->kstack_id = ts->out_kstack;
+	w->ustack_id = ts->out_ustack;
+
+	for (i = 0; i < HT_MAX_HOPS; i++) {
+		struct hop_link *l = &ts->links[i];
+		struct ht_hop *h = &w->hops[i];
+		__u64 ns;
+
+		if (i >= max_hops || i >= ts->depth)
+			break;
+		if (!l->flags && !l->pid)
+			break;
+
+		ns = overlap(prev_out, prev_in, l->w_out, l->w_in);
+		if (l->flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE))
+			ns = 0;
+
+		h->pid = l->pid;
+		h->tgid = l->tgid;
+		__builtin_memcpy(h->comm, l->comm, TASK_COMM_LEN);
+		h->ns = ns;
+		h->cause = l->w_cause;
+		h->kstack_id = l->w_kstack;
+		h->flags = l->flags;
+		if (!ns)
+			h->flags |= HT_HOP_ONCPU;
+		if (l->w_in && l->w_in < prev_out)
+			h->flags |= HT_HOP_STALE;
+		nhops = i + 1;
+
+		/* an interrupt ends the chain */
+		if (l->flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE))
+			break;
+		/* nothing left to explain: the waker was running */
+		if (!ns)
+			break;
+		prev_out = l->w_out;
+		prev_in = l->w_in;
+	}
+	w->nhops = nhops;
+}
+
+SEC("tp_btf/sched_switch")
+int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
+	     struct task_struct *next, unsigned int prev_state)
+{
+	struct task_state *ts;
+	__u64 now = bpf_ktime_get_ns();
+	bool track_prev = in_target(prev);
+	__u64 lo, hi, blocked_ns;
+	__u32 cause;
+
+	/* prev leaves the CPU */
+	if (prev->pid) {
+		ts = bpf_task_storage_get(&task_states, prev, NULL,
+					  BPF_LOCAL_STORAGE_GET_F_CREATE);
+		if (!ts) {
+			stat_inc(HT_STAT_STORAGE_FAIL);
+		} else if (!(prev_state & TASK_DEAD)) {
+			if (ts->is_root && ts->frame_start && ts->in_ts)
+				add_cause(ts, HT_ONCPU,
+					  clip(ts->in_ts, now, ts->frame_start));
+			ts->out_ts = now;
+			ts->out_state = preempt ? TASK_RUNNING : prev_state;
+			ts->out_iowait = BPF_CORE_READ_BITFIELD_PROBED(prev, in_iowait);
+			if (track_prev && prev_state != TASK_RUNNING && !preempt) {
+				ts->out_kstack = kernel_stack(ctx);
+				ts->out_ustack = user_stack(ctx, prev);
+			} else {
+				ts->out_kstack = -1;
+				ts->out_ustack = -1;
+			}
+		}
+	}
+
+	/* next returns to the CPU */
+	ts = bpf_task_storage_get(&task_states, next, NULL, 0);
+	if (!ts)
+		return 0;
+	if (!ts->out_ts) {
+		ts->in_ts = now;
+		return 0;
+	}
+
+	lo = ts->out_ts;
+	hi = now;
+	if (ts->out_state == TASK_RUNNING) {
+		cause = HT_RUNNABLE;
+	} else if (ts->wake_ts > lo && ts->wake_ts < now) {
+		hi = ts->wake_ts;
+		if (ts->links[0].flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE))
+			cause = ts->out_iowait ? HT_BLOCK_IO : HT_BLOCK_TIMER;
+		else
+			cause = ts->out_iowait ? HT_BLOCK_IO : HT_BLOCK_TASK;
+	} else if (ts->wake_ts) {
+		cause = ts->out_iowait ? HT_BLOCK_IO : HT_BLOCK_TASK;
+	} else {
+		cause = HT_BLOCK_OTHER;
+	}
+
+	/* hand this interval to whoever this task wakes next */
+	ts->last_out = lo;
+	ts->last_in = now;
+	ts->last_cause = cause;
+	ts->last_kstack = ts->out_kstack;
+
+	if (ts->is_root && ts->frame_start) {
+		blocked_ns = clip(lo, hi, ts->frame_start);
+		add_cause(ts, cause, blocked_ns);
+		add_cause(ts, HT_RUNQUEUE, clip(hi, now, ts->frame_start));
+		ts->nstalls++;
+		stat_inc(HT_STAT_STALLS);
+		if (cause != HT_RUNNABLE && blocked_ns)
+			resolve(ts, lo > ts->frame_start ? lo : ts->frame_start,
+				hi, cause, blocked_ns);
+	}
+
+	ts->out_ts = 0;
+	ts->wake_ts = 0;
+	ts->in_ts = now;
+	return 0;
+}
+
+/*
+ * The frame marker. Closes the frame that was open on this thread, emits it
+ * if it went over budget, and opens the next one.
+ */
+SEC("uprobe")
+int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
+{
+	struct task_struct *cur = bpf_get_current_task_btf();
+	__u64 now = bpf_ktime_get_ns(), frame_ns;
+	struct task_state *ts;
+	struct ht_record *rec;
+
+	if (!in_target(cur))
+		return 0;
+	ts = bpf_task_storage_get(&task_states, cur, NULL,
+				  BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!ts) {
+		stat_inc(HT_STAT_STORAGE_FAIL);
+		return 0;
+	}
+
+	if (ts->frame_start && ts->frame_start < now) {
+		/* the root is running right now: close its on-CPU tail */
+		if (ts->in_ts)
+			add_cause(ts, HT_ONCPU, clip(ts->in_ts, now, ts->frame_start));
+		else
+			ts->frame_flags |= HT_FRAME_NO_ROOT_STATE;
+		frame_ns = now - ts->frame_start;
+		stat_inc(HT_STAT_FRAMES);
+
+		if (frame_ns > budget_ns) {
+			stat_inc(HT_STAT_HITCHES);
+			rec = bpf_ringbuf_reserve(&events, sizeof(*rec), 0);
+			if (!rec) {
+				stat_inc(HT_STAT_RINGBUF_FULL);
+			} else {
+				rec->frame_id = frame_id;
+				rec->frame_start_ns = ts->frame_start;
+				rec->frame_end_ns = now;
+				rec->frame_ns = frame_ns;
+				rec->budget_ns = budget_ns;
+				__builtin_memcpy(rec->cause_ns, ts->cause_ns,
+						 sizeof(rec->cause_ns));
+				__builtin_memcpy(&rec->worst, &ts->worst,
+						 sizeof(rec->worst));
+				rec->root_pid = cur->pid;
+				rec->root_tgid = cur->tgid;
+				__builtin_memcpy(rec->root_comm, cur->comm,
+						 TASK_COMM_LEN);
+				rec->nstalls = ts->nstalls;
+				rec->flags = ts->frame_flags;
+				bpf_ringbuf_submit(rec, 0);
+				stat_inc(HT_STAT_EMITTED);
+			}
+		}
+	}
+
+	/* open the next frame */
+	ts->is_root = true;
+	ts->frame_start = now;
+	ts->frame_id = frame_id;
+	ts->nstalls = 0;
+	ts->frame_flags = 0;
+	ts->in_ts = now;
+	__builtin_memset(ts->cause_ns, 0, sizeof(ts->cause_ns));
+	__builtin_memset(&ts->worst, 0, sizeof(ts->worst));
+	return 0;
+}
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
