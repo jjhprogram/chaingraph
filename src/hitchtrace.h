@@ -24,6 +24,7 @@
 #define TASK_COMM_LEN		16
 #define HT_MAX_HOPS		5	/* chain hops kept for the worst stall */
 #define HT_PERF_MAX_STACK	32	/* frames per kernel stack */
+#define HT_MAX_THREADS		16	/* per-thread detail slots in a record */
 
 /*
  * Root-timeline buckets. HT_ONCPU..HT_BLOCK_OTHER partition the frame;
@@ -56,6 +57,11 @@ enum ht_cause {
 #define HT_FRAME_OPEN_STALL	(1U << 0)	/* a stall was still open at frame end */
 #define HT_FRAME_NO_ROOT_STATE	(1U << 1)	/* root state was created mid-frame */
 #define HT_FRAME_LOST		(1U << 2)	/* some accounting was dropped */
+#define HT_FRAME_THREADS_FULL	(1U << 3)	/* more threads than HT_MAX_THREADS */
+
+/* ht_thread.flags */
+#define HT_THREAD_ROOT		(1U << 0)	/* this is the frame's root thread */
+#define HT_THREAD_BLOCKED_END	(1U << 1)	/* still off-CPU when the frame closed */
 
 /*
  * One hop of the resolved chain for the frame's worst blocked interval.
@@ -83,6 +89,26 @@ struct ht_stall {
 	struct ht_hop hops[HT_MAX_HOPS];
 };
 
+/*
+ * What one thread of the process did during the frame. The root's own line
+ * partitions frame_ns; the others are context, since threads run in parallel
+ * and their off-CPU time is not part of the frame's critical path.
+ */
+struct ht_thread {
+	__u32 pid;
+	__u32 flags;			/* HT_THREAD_* */
+	char comm[TASK_COMM_LEN];
+	__u64 cause_ns[HT_CAUSE_PARTITION];
+	__u64 open_ns;			/* of a stall still open at frame end */
+	__u64 largest_ns;		/* longest single off-CPU interval */
+	__u32 largest_cause;
+	__s32 largest_kstack;
+	__u32 preemptor_pid;		/* who took the CPU, longest first */
+	__u32 preemptor_tgid;
+	char preemptor_comm[TASK_COMM_LEN];
+	__u64 preemptor_ns;
+};
+
 /* One over-budget frame. */
 struct ht_record {
 	__u64 frame_id;
@@ -97,6 +123,9 @@ struct ht_record {
 	char root_comm[TASK_COMM_LEN];
 	__u32 nstalls;		/* blocked/runnable intervals in this frame */
 	__u32 flags;		/* HT_FRAME_* */
+	__u32 nthreads;		/* valid entries in threads[] */
+	__u32 __pad;
+	struct ht_thread threads[HT_MAX_THREADS];
 };
 
 /* Per-CPU stats, indexed by enum ht_stat. */
@@ -110,6 +139,7 @@ enum ht_stat {
 	HT_STAT_UNRESOLVED,	/* ... where the waker's state was unusable */
 	HT_STAT_STORAGE_FAIL,	/* bpf_task_storage_get() returned NULL */
 	HT_STAT_STACK_ERR,	/* bpf_get_stackid() failures */
+	HT_STAT_SLOTS_FULL,	/* threads beyond HT_MAX_THREADS */
 	HT_STAT_MAX,
 };
 

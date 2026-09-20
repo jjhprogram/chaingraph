@@ -70,6 +70,10 @@ struct task_state {
 	__s32 last_kstack;
 	__u32 depth;		/* valid entries in links[] */
 	__u32 seq;		/* odd while links[] is being rewritten */
+	__u32 slot1;		/* per-thread record slot, 1-based; 0 = none */
+	__u32 preempt_pid;	/* who took the CPU at the last preemption */
+	__u32 preempt_tgid;
+	char preempt_comm[TASK_COMM_LEN];
 	struct hop_link links[HT_MAX_HOPS];
 
 	/* frame accounting, used only by a root thread */
@@ -107,6 +111,52 @@ struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 8 << 20);
 } events SEC(".maps");
+
+/*
+ * The frame currently open on the target process. Threads other than the root
+ * read it to know which window to clip their intervals to, and which epoch
+ * their per-thread slot belongs to.
+ */
+struct frame_ctx {
+	__u64 frame_start;
+	__u64 frame_id;
+	__u32 epoch;
+	__u32 root_pid;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct frame_ctx);
+} frame_state SEC(".maps");
+
+/*
+ * Per-thread detail for the open frame. Each thread writes its own slot as it
+ * is scheduled, so closing a frame is a bounded walk over slots rather than a
+ * walk over tasks. Slots are claimed on first sight and never freed: a thread
+ * that exits keeps its slot for the run (prototype limitation).
+ */
+struct thread_slot {
+	__u32 epoch;
+	__u32 __pad;
+	__u64 out_ts;		/* set while the thread is off-CPU */
+	struct ht_thread th;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, HT_MAX_THREADS);
+	__type(key, __u32);
+	__type(value, struct thread_slot);
+} thread_slots SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} slot_next SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -253,6 +303,49 @@ static __always_inline __s32 user_stack(void *ctx, struct task_struct *t)
 		return -1;
 	}
 	return id;
+}
+
+static __always_inline struct frame_ctx *frame_ctx(void)
+{
+	__u32 zero = 0;
+
+	return bpf_map_lookup_elem(&frame_state, &zero);
+}
+
+/* This thread's slot for @epoch, zeroed if it still holds an older frame. */
+static __always_inline struct thread_slot *slot_of(struct task_state *ts,
+						   struct task_struct *t,
+						   __u32 epoch)
+{
+	struct thread_slot *s;
+	__u32 idx, zero = 0, *next;
+
+	if (!ts->slot1) {
+		next = bpf_map_lookup_elem(&slot_next, &zero);
+		if (!next)
+			return NULL;
+		idx = __sync_fetch_and_add(next, 1);
+		if (idx >= HT_MAX_THREADS) {
+			stat_inc(HT_STAT_SLOTS_FULL);
+			return NULL;
+		}
+		ts->slot1 = idx + 1;
+	}
+	idx = ts->slot1 - 1;
+	if (idx >= HT_MAX_THREADS)
+		return NULL;
+	s = bpf_map_lookup_elem(&thread_slots, &idx);
+	if (!s)
+		return NULL;
+	if (s->epoch != epoch) {
+		/* out_ts belongs to the thread, not to the frame: a thread that
+		 * is off-CPU stays off-CPU across the boundary */
+		__builtin_memset(&s->th, 0, sizeof(s->th));
+		s->epoch = epoch;
+	}
+	s->th.pid = t->pid;
+	__builtin_memcpy(s->th.comm, t->comm, TASK_COMM_LEN);
+	return s;
 }
 
 static __always_inline bool in_target(struct task_struct *t)
@@ -447,7 +540,7 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
 {
 	struct task_state *ts;
 	__u64 now = bpf_ktime_get_ns();
-	bool track_prev = in_target(prev);
+	bool track_prev = in_target(prev), track_next = in_target(next);
 	__u64 lo, hi, blocked_ns;
 	__u32 cause;
 
@@ -461,6 +554,29 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
 			if (ts->is_root && ts->frame_start && ts->in_ts)
 				add_cause(ts, HT_ONCPU,
 					  clip(ts->in_ts, now, ts->frame_start));
+			if (track_prev) {
+				struct frame_ctx *fc = frame_ctx();
+
+				if (fc && fc->frame_start) {
+					struct thread_slot *sl =
+						slot_of(ts, prev, fc->epoch);
+
+					if (sl) {
+						if (ts->in_ts)
+							sl->th.cause_ns[HT_ONCPU] +=
+								clip(ts->in_ts, now,
+								     fc->frame_start);
+						sl->out_ts = now;
+					}
+				}
+				/* who took the CPU, for the runnable bucket */
+				if (preempt || prev_state == TASK_RUNNING) {
+					ts->preempt_pid = next->pid;
+					ts->preempt_tgid = next->tgid;
+					__builtin_memcpy(ts->preempt_comm,
+							 next->comm, TASK_COMM_LEN);
+				}
+			}
 			ts->out_ts = now;
 			ts->out_state = preempt ? TASK_RUNNING : prev_state;
 			ts->out_iowait = BPF_CORE_READ_BITFIELD_PROBED(prev, in_iowait);
@@ -505,6 +621,38 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
 	ts->last_cause = cause;
 	ts->last_kstack = ts->out_kstack;
 
+	if (track_next) {
+		struct frame_ctx *fc = frame_ctx();
+
+		if (fc && fc->frame_start) {
+			struct thread_slot *sl = slot_of(ts, next, fc->epoch);
+
+			if (sl) {
+				__u64 b = clip(lo, hi, fc->frame_start);
+				__u64 rq = clip(hi, now, fc->frame_start);
+
+				if (cause < HT_CAUSE_PARTITION)
+					sl->th.cause_ns[cause] += b;
+				sl->th.cause_ns[HT_RUNQUEUE] += rq;
+				sl->out_ts = 0;
+				if (b + rq > sl->th.largest_ns) {
+					sl->th.largest_ns = b + rq;
+					sl->th.largest_cause = cause;
+					sl->th.largest_kstack = ts->out_kstack;
+				}
+				if (cause == HT_RUNNABLE && ts->preempt_pid &&
+				    b + rq > sl->th.preemptor_ns) {
+					sl->th.preemptor_ns = b + rq;
+					sl->th.preemptor_pid = ts->preempt_pid;
+					sl->th.preemptor_tgid = ts->preempt_tgid;
+					__builtin_memcpy(sl->th.preemptor_comm,
+							 ts->preempt_comm,
+							 TASK_COMM_LEN);
+				}
+			}
+		}
+	}
+
 	if (ts->is_root && ts->frame_start) {
 		blocked_ns = clip(lo, hi, ts->frame_start);
 		add_cause(ts, cause, blocked_ns);
@@ -531,8 +679,10 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 {
 	struct task_struct *cur = bpf_get_current_task_btf();
 	__u64 now = bpf_ktime_get_ns(), frame_ns;
+	struct frame_ctx *fc = frame_ctx();
 	struct task_state *ts;
 	struct ht_record *rec;
+	__u32 i, nthreads = 0;
 
 	if (!in_target(cur))
 		return 0;
@@ -573,13 +723,68 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 						 TASK_COMM_LEN);
 				rec->nstalls = ts->nstalls;
 				rec->flags = ts->frame_flags;
+
+				/*
+				 * Per-thread detail: each thread of the process
+				 * wrote its own slot as it was scheduled. A
+				 * thread still off-CPU now never got to close
+				 * its last interval, so do it here.
+				 */
+				for (i = 0; i < HT_MAX_THREADS; i++) {
+					struct thread_slot *sl =
+						bpf_map_lookup_elem(&thread_slots, &i);
+
+					if (!sl || !fc || !sl->th.pid)
+						continue;
+					if (sl->epoch != fc->epoch) {
+						/* never scheduled this frame: only
+						 * interesting if it is still blocked */
+						if (!sl->out_ts)
+							continue;
+						__builtin_memset(sl->th.cause_ns, 0,
+								 sizeof(sl->th.cause_ns));
+						sl->th.largest_ns = 0;
+						sl->th.preemptor_ns = 0;
+						sl->th.open_ns = 0;
+						sl->th.flags = 0;
+						sl->epoch = fc->epoch;
+					}
+					if (sl->out_ts) {
+						sl->th.open_ns =
+							clip(sl->out_ts, now,
+							     ts->frame_start);
+						sl->th.flags |= HT_THREAD_BLOCKED_END;
+						rec->flags |= HT_FRAME_OPEN_STALL;
+					}
+					if (sl->th.pid == (__u32)cur->pid) {
+						sl->th.flags |= HT_THREAD_ROOT;
+						if (ts->in_ts)
+							sl->th.cause_ns[HT_ONCPU] +=
+								clip(ts->in_ts, now,
+								     ts->frame_start);
+					}
+					if (nthreads < HT_MAX_THREADS) {
+						__builtin_memcpy(&rec->threads[nthreads],
+								 &sl->th,
+								 sizeof(struct ht_thread));
+						nthreads++;
+					}
+				}
+				rec->nthreads = nthreads;
+				rec->__pad = 0;
 				bpf_ringbuf_submit(rec, 0);
 				stat_inc(HT_STAT_EMITTED);
 			}
 		}
 	}
 
-	/* open the next frame */
+	/* open the next frame, and publish it to the other threads */
+	if (fc) {
+		fc->frame_start = now;
+		fc->frame_id = frame_id;
+		fc->root_pid = cur->pid;
+		fc->epoch++;
+	}
 	ts->is_root = true;
 	ts->frame_start = now;
 	ts->frame_id = frame_id;
