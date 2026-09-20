@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -40,6 +41,14 @@ def causes(**kwargs):
     out = {name: 0 for name in ch.BUCKETS}
     for name, ns in kwargs.items():
         out[ch.normalize_bucket(name)] = ns
+    return out
+
+
+def cause_array(**kwargs):
+    """The same, as the JSON array in enum order hitchtrace may write."""
+    out = [0] * len(ch.BUCKETS)
+    for name, ns in kwargs.items():
+        out[ch.IDX[ch.normalize_bucket(name)]] = ns
     return out
 
 
@@ -143,6 +152,39 @@ def preempt_record(frame_id, preemptor=("hb_hog0", 4250, 9_000_000)):
                            thread("hb_hog0", 4250, oncpu=20_000_000)])
 
 
+# The same worker stall under the new taxonomy: the root waits on a condvar,
+# so the wait is a futex wait, and it is still resolved through the waker.
+def futex_record(frame_id, resolved="inherited", **kwargs):
+    other = ("resolved_wait_oncpu" if resolved == "inherited"
+             else "resolved_inherited")
+    c = causes(oncpu=4_000_000, block_futex=20_000_000,
+               **{ch.normalize_bucket(resolved): 18_000_000, other: 2_000_000})
+    return record(frame_id, c, worst_cause="block_futex",
+                  hops=[hop("hb_worker", 18_000_000, cause="block_io")],
+                  **kwargs)
+
+
+# root polled for an event that arrived late
+def poll_record(frame_id):
+    return record(frame_id, causes(oncpu=4_000_000, block_poll=20_000_000,
+                                   resolved_inherited=18_000_000),
+                  worst_cause="block_poll",
+                  hops=[hop("hb_worker", 18_000_000, cause="block_io")])
+
+
+# root never left the CPU: the frame is on-CPU time, most of it in minor
+# faults carved out of HT_ONCPU when the frame closed
+def fault_record(frame_id, oncpu=6_000_000, fault=16_000_000,
+                 fault_major=1_000_000, reclaim=1_000_000, compact=0,
+                 frame_ns=HITCH_NS, threads=None):
+    return record(frame_id,
+                  causes(oncpu=oncpu, oncpu_fault=fault,
+                         oncpu_fault_major=fault_major,
+                         oncpu_reclaim=reclaim, oncpu_compact=compact),
+                  worst_cause="oncpu_fault", frame_ns=frame_ns,
+                  threads=threads)
+
+
 # root slept on a timer and was woken from the timer interrupt
 def timer_record(frame_id):
     return record(frame_id, causes(oncpu=4_000_000, block_timer=20_000_000),
@@ -169,6 +211,49 @@ def scene(n_normal=12, injected=(("worker_block", "HT_BLOCK_TASK", 4),),
             if records_for is None or frame_id in records_for:
                 recs.append(make_record(frame_id))
     return frames, recs
+
+
+SPEC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "run_hitch_tests.sh")
+HEADER_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "src", "hitchtrace.h")
+
+
+def read_enum_causes():
+    """enum ht_cause from src/hitchtrace.h, in order, as enum names.
+
+    HT_CAUSE_PARTITION and HT_CAUSE_MAX are markers rather than buckets, and
+    HT_RESOLVED_WAIT_ONCPU shares the first one's value.
+    """
+    with open(HEADER_PATH, encoding="utf-8") as f:
+        body = f.read().split("enum ht_cause {", 1)[1].split("};", 1)[0]
+    body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+    names = []
+    for item in body.split(","):
+        name = item.split("=")[0].strip()
+        if name and name not in ("HT_CAUSE_PARTITION", "HT_CAUSE_MAX"):
+            names.append(name)
+    return names
+
+
+def read_class_specs():
+    """The CLASS_SPECS rows of run_hitch_tests.sh, each split on '|'.
+
+    The shell table is what actually runs against a live target, so the
+    buckets it names are checked here rather than discovered by root.
+    """
+    rows, inside = [], False
+    with open(SPEC_PATH, encoding="utf-8") as f:
+        for line in f:
+            text = line.strip()
+            if not inside:
+                inside = text.startswith("CLASS_SPECS=(")
+            elif text == ")":
+                break
+            elif text.startswith('"') and text.endswith('"'):
+                rows.append(text[1:-1].split("|"))
+    return rows
 
 
 def write_jsonl(path, objs):
@@ -217,7 +302,7 @@ class CliTest(unittest.TestCase):
 
 class NormalizeTest(unittest.TestCase):
     def test_bucket_spellings(self):
-        for spelling in ("HT_BLOCK_TASK", "block_task", " Block-Task ", 3):
+        for spelling in ("HT_BLOCK_TASK", "block_task", " Block-Task ", 13):
             self.assertEqual(ch.normalize_bucket(spelling), "block_task")
         self.assertEqual(ch.normalize_bucket("inherited"), "resolved_inherited")
         self.assertEqual(ch.normalize_bucket("wait_oncpu"),
@@ -225,17 +310,67 @@ class NormalizeTest(unittest.TestCase):
         self.assertEqual(ch.enum_name("resolved_inherited"),
                          "HT_RESOLVED_INHERITED")
 
+    def test_every_cause_answers_to_both_spellings(self):
+        # the JSON key hitchtrace writes and the enum name the plan and the
+        # shell table use, for every entry of enum ht_cause
+        for i, name in enumerate(ch.BUCKETS):
+            self.assertEqual(ch.normalize_bucket(name), name)
+            self.assertEqual(ch.normalize_bucket(ch.enum_name(name)), name)
+            self.assertEqual(ch.normalize_bucket(name.upper()), name)
+            self.assertEqual(ch.normalize_bucket(i), name)
+
+    def test_the_new_taxonomy_is_known(self):
+        # the plan's 2.3 buckets, which the old table did not have
+        for spelling, name in (("HT_ONCPU_FAULT", "oncpu_fault"),
+                               ("HT_ONCPU_FAULT_MAJOR", "oncpu_fault_major"),
+                               ("oncpu_reclaim", "oncpu_reclaim"),
+                               ("HT_ONCPU_COMPACT", "oncpu_compact"),
+                               ("block_futex", "block_futex"),
+                               ("HT_BLOCK_POLL", "block_poll"),
+                               ("HT_BLOCK_GPU", "block_gpu"),
+                               ("block_present", "block_present")):
+            self.assertEqual(ch.normalize_bucket(spelling), name)
+
+    def test_the_old_aliases_still_work(self):
+        for spelling in ("wait_oncpu", "waitoncpu", "resolved_waker_oncpu",
+                         "HT_CAUSE_PARTITION"):
+            self.assertEqual(ch.normalize_bucket(spelling),
+                             "resolved_wait_oncpu")
+        self.assertEqual(ch.normalize_bucket("oncpu_major_fault"),
+                         "oncpu_fault_major")
+
     def test_unknown_bucket(self):
         with self.assertRaises(ValueError):
-            ch.normalize_bucket("HT_GPU_WAIT")
+            ch.normalize_bucket("HT_GPU_WAIT")	# HT_BLOCK_GPU, not this
         with self.assertRaises(ValueError):
             ch.normalize_bucket(99)
 
     def test_partition_matches_the_contract(self):
         # HT_ONCPU..HT_BLOCK_OTHER is the partition; the rest is resolution.
-        self.assertEqual(ch.BUCKETS[:ch.PARTITION][0], "oncpu")
+        # The boundary is read off the table, never counted out by hand.
+        self.assertEqual(ch.BUCKETS[0], "oncpu")
         self.assertEqual(ch.BUCKETS[ch.PARTITION - 1], "block_other")
-        self.assertEqual(len(ch.BUCKETS), 9)
+        self.assertEqual(ch.BUCKETS[ch.PARTITION], "resolved_wait_oncpu")
+        self.assertEqual(ch.PARTITION, ch.IDX["resolved_wait_oncpu"])
+        # enum ht_cause: 15 partition buckets and the resolved pair
+        self.assertEqual((ch.PARTITION, len(ch.BUCKETS)), (15, 17))
+
+    def test_bucket_groups_follow_the_table(self):
+        self.assertEqual([ch.BUCKETS[i] for i in ch.ONCPU_BUCKETS],
+                         ["oncpu", "oncpu_fault", "oncpu_fault_major",
+                          "oncpu_reclaim", "oncpu_compact"])
+        self.assertEqual([ch.BUCKETS[i] for i in ch.ONCPU_STALLS],
+                         ["oncpu_fault", "oncpu_fault_major", "oncpu_reclaim",
+                          "oncpu_compact"])
+        self.assertEqual([ch.BUCKETS[i] for i in ch.BLOCKED],
+                         ["block_futex", "block_poll", "block_io",
+                          "block_timer", "block_gpu", "block_present",
+                          "block_task", "block_other"])
+        # runnable and runqueue are off-CPU but nobody woke the thread out
+        # of them, so the resolved pair does not split them
+        for name in ("runnable", "runqueue"):
+            self.assertNotIn(ch.IDX[name], ch.BLOCKED)
+            self.assertNotIn(ch.IDX[name], ch.ONCPU_BUCKETS)
 
     def test_flags_as_bitmask_or_names(self):
         self.assertEqual(ch.normalize_flags(1 << 0 | 1 << 4, ch.HOP_FLAG_BITS),
@@ -259,13 +394,39 @@ class ParseTest(unittest.TestCase):
 
     def test_cause_ns_as_array(self):
         rec = worker_block_record(1)
-        rec["cause_ns"] = [4_000_000, 0, 0, 20_000_000, 0, 0, 0,
-                           2_000_000, 18_000_000]
+        rec["cause_ns"] = cause_array(oncpu=4_000_000, block_task=20_000_000,
+                                      resolved_wait_oncpu=2_000_000,
+                                      resolved_inherited=18_000_000)
         recs, skipped = ch.read_records(self.write("h.jsonl", [rec]))
         self.assertEqual(skipped, 0)
         self.assertEqual(recs[0].bucket("block_task"), 20_000_000)
         self.assertEqual(recs[0].largest(), "block_task")
         self.assertEqual(recs[0].excess_ns, HITCH_NS - BUDGET_NS)
+
+    def test_cause_ns_as_a_partition_length_array(self):
+        # a timeline without the resolved pair, as ht_thread carries it
+        rec = worker_block_record(1)
+        rec["cause_ns"] = cause_array(oncpu=4_000_000,
+                                      block_futex=20_000_000)[:ch.PARTITION]
+        recs, _ = ch.read_records(self.write("h.jsonl", [rec]))
+        self.assertEqual(recs[0].largest(), "block_futex")
+
+    def test_an_array_of_the_wrong_length_is_a_parse_error(self):
+        rec = worker_block_record(1)
+        rec["cause_ns"] = [0] * (len(ch.BUCKETS) - 1)
+        with self.assertRaises(ch.ParseError) as cm:
+            ch.read_records(self.write("h.jsonl", [rec]))
+        self.assertIn("cause_ns has", str(cm.exception))
+
+    def test_the_new_buckets_parse(self):
+        rec = record(1, causes(oncpu=4_000_000, oncpu_fault=2_000_000,
+                               block_futex=16_000_000, block_poll=2_000_000,
+                               resolved_inherited=15_000_000),
+                     worst_cause="block_futex")
+        recs, _ = ch.read_records(self.write("h.jsonl", [rec]))
+        self.assertEqual(recs[0].largest(), "block_futex")
+        self.assertEqual(recs[0].bucket("oncpu_fault"), 2_000_000)
+        self.assertEqual(recs[0].worst_cause, "block_futex")
 
     def test_non_record_lines_are_ignored(self):
         path = self.write("h.jsonl", [{"stats": {"frames": 10}},
@@ -528,6 +689,57 @@ class ExpectTest(CliTest):
                          "--bucket", "HT_BLOCK_TASK", "--min-frac", "0.9"],
                         "below --min-frac")
 
+    def test_a_futex_wait_is_resolved_through_its_waker(self):
+        # worker_block and worker_cpu now land in HT_BLOCK_FUTEX (the root
+        # waits on a condvar), and the resolution is unchanged
+        frames, recs = scene(injected=(("worker_block", "HT_BLOCK_FUTEX", 4),),
+                             make_record=futex_record)
+        gt, hitch = self.files(frames, recs)
+        self.assertPass(["expect", gt, hitch, "--class", "worker_block",
+                         "--bucket", "HT_BLOCK_FUTEX",
+                         "--resolved", "inherited",
+                         "--chain", "hb_worker", "--min-frames", "4"])
+        self.assertFail(["expect", gt, hitch, "--class", "worker_block",
+                         "--bucket", "HT_BLOCK_FUTEX",
+                         "--resolved", "wait_oncpu"],
+                        "wrong resolution",
+                        "HT_RESOLVED_WAIT_ONCPU is 2.000 ms of the 20.000 ms "
+                        "the frame spent blocked")
+
+    def test_a_frame_that_blocked_nowhere_resolves_nothing(self):
+        frames, recs = scene(injected=(("fault", "HT_ONCPU_FAULT", 2),),
+                             make_record=fault_record)
+        gt, hitch = self.files(frames, recs)
+        self.assertFail(["expect", gt, hitch, "--class", "fault",
+                         "--bucket", "HT_ONCPU_FAULT",
+                         "--resolved", "inherited"],
+                        "blocked nowhere, nothing to resolve")
+
+    def test_every_new_bucket_can_be_the_diagnosis(self):
+        # one class per 2.3 bucket, each dominated by the bucket it expects
+        for cls, bucket, make in (("poll", "HT_BLOCK_POLL", poll_record),
+                                  ("fault", "HT_ONCPU_FAULT", fault_record),
+                                  ("worker_cpu", "HT_BLOCK_FUTEX",
+                                   futex_record)):
+            with self.subTest(cls=cls):
+                frames, recs = scene(injected=((cls, bucket, 3),),
+                                     make_record=make)
+                gt, hitch = self.files(frames, recs)
+                self.assertPass(["expect", gt, hitch, "--class", cls,
+                                 "--bucket", bucket, "--min-frames", "3"])
+
+    def test_a_fault_frame_is_not_plain_on_cpu_time(self):
+        # the frame is on-CPU the whole time, but the faults are carved out
+        # of HT_ONCPU, so they and not it are the diagnosis
+        frames, recs = scene(injected=(("fault", "HT_ONCPU_FAULT", 3),),
+                             make_record=fault_record)
+        gt, hitch = self.files(frames, recs)
+        self.assertPass(["expect", gt, hitch, "--class", "fault",
+                         "--bucket", "HT_ONCPU_FAULT", "--min-frames", "3"])
+        self.assertFail(["expect", gt, hitch, "--class", "fault",
+                         "--bucket", "HT_ONCPU"],
+                        "wrong bucket", "largest bucket is HT_ONCPU_FAULT")
+
     def test_unknown_class_names_what_is_there(self):
         frames, recs = scene()
         gt, hitch = self.files(frames, recs)
@@ -635,6 +847,37 @@ class ThreadsCommandTest(CliTest):
                          "--thread", "hb_feeder", "--bucket", "HT_BLOCK_TASK",
                          "--min-frac", "0.9"],
                         "below --min-frac")
+
+    def test_bucket_any_spans_the_names_one_wait_can_take(self):
+        # run_hitch_tests.sh's worker_block row: hb_worker blocks in a pipe
+        # read, which the new rules may name TASK, FUTEX or TIMER
+        for name in ("block_task", "block_futex", "block_timer"):
+            with self.subTest(bucket=name):
+                gt, hitch = self.scene(
+                    make_record=lambda fid, n=name: threaded_record(
+                        fid, threads=worker_block_threads() + [
+                            thread("hb_worker2", 4245,
+                                   largest=(20_000_000, n, "pipe_read"),
+                                   **{n: 21_000_000})]))
+                self.assertPass(["threads", gt, hitch, "--class",
+                                 "worker_block", "--thread", "hb_worker2",
+                                 "--bucket-any",
+                                 "HT_BLOCK_TASK,HT_BLOCK_FUTEX,HT_BLOCK_TIMER",
+                                 "--min-frames", "4"])
+
+    def test_on_cpu_stalls_are_not_off_cpu_time(self):
+        # hb_feeder faulted for 3 ms and blocked for 4: a fault is time on a
+        # CPU, so all 4 ms of its off-CPU time are the wait --min-frac asks
+        # about, not 4 of 7
+        gt, hitch = self.scene(
+            make_record=lambda fid: threaded_record(
+                fid, threads=worker_block_threads() + [
+                    thread("hb_feeder", 4244, oncpu=2_000_000,
+                           oncpu_fault=3_000_000, block_task=4_000_000,
+                           largest=(4_000_000, "block_task", "pipe_write"))]))
+        self.assertPass(["threads", gt, hitch, "--class", "worker_block",
+                         "--thread", "hb_feeder", "--bucket", "HT_BLOCK_TASK",
+                         "--min-frac", "0.9", "--min-frames", "4"])
 
     def test_min_frac_is_measured_against_the_thread_off_cpu_time(self):
         # 6 ms of the worker's 20 ms off-CPU: the largest, but only 0.30 of it
@@ -790,15 +1033,92 @@ class InvariantTest(CliTest):
         self.assertIn("frame_ns is 24.000 ms", text)
         self.assertNotIn("frame 1:", text)
 
-    def test_resolved_exceeds_block_task(self):
+    def test_resolved_exceeds_the_blocked_time(self):
         rec = worker_block_record(1)
         rec["cause_ns"]["resolved_wait_oncpu"] = 20_000_000	# + 18 ms > 20 ms
         _, hitch = self.files([], [rec])
-        self.assertFail(["invariant", hitch], "exceeds HT_BLOCK_TASK")
+        self.assertFail(["invariant", hitch],
+                        "exceeds the 20.000 ms the frame spent blocked")
+
+    def test_a_futex_wait_may_be_resolved_too(self):
+        # the pair splits any wait a task ended, not just HT_BLOCK_TASK
+        _, hitch = self.files([], [futex_record(1)])
+        self.assertPass(["invariant", hitch])
+        rec = futex_record(2)
+        rec["cause_ns"]["block_futex"] = 5_000_000	# 20 resolved of 5 ms
+        rec["cause_ns"]["oncpu"] = 19_000_000		# ... still partitions
+        _, hitch = self.files([], [rec])
+        self.assertFail(["invariant", hitch], "exceeds the 5.000 ms")
 
     def test_no_records_is_vacuously_fine(self):
         _, hitch = self.files([], [])
         self.assertPass(["invariant", hitch])
+
+
+class OncpuStallTest(CliTest):
+    """--oncpu-stall: the buckets carved out of HT_ONCPU at frame close."""
+
+    def test_a_fault_frame_adds_up(self):
+        _, hitch = self.files([], [fault_record(1), fault_record(2)])
+        text = self.assertPass(["invariant", hitch, "--oncpu-stall"])
+        self.assertIn("2 record(s) partition frame_ns", text)
+        self.assertIn("on-CPU stalls fit the frame", text)
+        # the option is off by default and says nothing when it is
+        self.assertNotIn("on-CPU stalls fit",
+                         self.assertPass(["invariant", hitch]))
+
+    def test_stalls_larger_than_the_frame(self):
+        # 25 ms of faults carved out of a 24 ms frame: impossible
+        rec = fault_record(1, oncpu=0, fault=25_000_000, fault_major=0,
+                           reclaim=0)
+        _, hitch = self.files([], [rec])
+        text = self.assertFail(["invariant", hitch, "--oncpu-stall"],
+                               "the on-CPU stalls sum to 25.000 ms",
+                               "more than the 24.000 ms frame")
+        self.assertIn("oncpu_fault 25.000 ms", text)
+
+    def test_an_underflowed_oncpu_is_named(self):
+        # the carve-out went below zero; HT_ONCPU is unsigned, so it wrapped
+        rec = fault_record(1)
+        rec["cause_ns"]["oncpu"] = 2 ** 64 - 3_000_000
+        _, hitch = self.files([], [rec])
+        self.assertFail(["invariant", hitch, "--oncpu-stall"],
+                        "took it below zero")
+        # without the option the wrap is only ever a partition failure
+        text = self.assertFail(["invariant", hitch], "partition sums to")
+        self.assertNotIn("below zero", text)
+
+    def test_a_thread_carve_out_is_checked_too(self):
+        # the record adds up and the root agrees with it; only hb_worker's
+        # own line wrapped, which nothing else looks at
+        threads = worker_block_threads() + [
+            thread("hb_feeder", 4244, oncpu=2 ** 64 - 1_000_000,
+                   largest=(1_000_000, "block_task", "pipe_write"))]
+        _, hitch = self.files([], [threaded_record(1, threads=threads)])
+        self.assertPass(["invariant", hitch])
+        self.assertFail(["invariant", hitch, "--oncpu-stall"],
+                        "hb_feeder/4244: HT_ONCPU is", "took it below zero")
+
+    def test_a_threads_stalls_must_fit_the_frame(self):
+        threads = worker_block_threads() + [
+            thread("hb_feeder", 4244, oncpu_fault=20_000_000,
+                   oncpu_reclaim=6_000_000,
+                   largest=(1_000_000, "block_task", "pipe_write"))]
+        _, hitch = self.files([], [threaded_record(1, threads=threads)])
+        self.assertPass(["invariant", hitch])
+        self.assertFail(["invariant", hitch, "--oncpu-stall"],
+                        "hb_feeder/4244: the on-CPU stalls sum to 26.000 ms")
+
+    def test_tolerance_applies_to_the_carve_out(self):
+        # 400 us of faults past the end of the frame: the same slack the
+        # partition check gives the same record
+        rec = fault_record(1, oncpu=0, fault=HITCH_NS + 400_000,
+                           fault_major=0, reclaim=0)
+        _, hitch = self.files([], [rec])
+        self.assertPass(["invariant", hitch, "--oncpu-stall"])
+        self.assertFail(["invariant", hitch, "--oncpu-stall",
+                         "--tol-us", "100"],
+                        "more than the 24.000 ms frame")
 
 
 class InvariantThreadsTest(CliTest):
@@ -900,6 +1220,120 @@ class QuietHonestyTest(CliTest):
                        frame_ns=NORMAL_NS)]
         gt, hitch = self.files(frames, recs)
         self.assertFail(["quiet", gt, hitch, "--max-false", "0"], "frame 60")
+
+
+class HeaderTableTest(unittest.TestCase):
+    """The bucket table is enum ht_cause; the header is where it comes from."""
+
+    @unittest.skipUnless(os.path.exists(HEADER_PATH), "no src/hitchtrace.h")
+    def test_the_table_is_the_enum(self):
+        names = read_enum_causes()
+        self.assertEqual([ch.enum_name(b) for b in ch.BUCKETS], names)
+        self.assertEqual(names[ch.PARTITION], "HT_RESOLVED_WAIT_ONCPU")
+
+
+class ShellTableTest(unittest.TestCase):
+    """run_hitch_tests.sh's table names buckets this checker has to know.
+
+    The end-to-end script cannot run here (it loads BPF programs), but its
+    CLASS_SPECS rows are just arguments to check_hitches.py, and a row that
+    names a bucket the table below does not have is a usage error at 3 a.m.
+    on a machine with root, not here.
+    """
+
+    def setUp(self):
+        self.rows = read_class_specs()
+        self.assertTrue(self.rows, "no CLASS_SPECS rows in %s" % SPEC_PATH)
+        self.by_class = {row[0]: row for row in self.rows}
+
+    def test_every_row_is_a_usable_check(self):
+        for row in self.rows:
+            with self.subTest(cls=row[0]):
+                # field 8 is optional: extra arguments for `expect`
+                self.assertIn(len(row), (7, 8),
+                              "row has %d fields" % len(row))
+                if row[1]:			# the expected bucket
+                    bucket = ch.normalize_bucket(row[1])
+                    self.assertLess(ch.IDX[bucket], ch.PARTITION,
+                                    "%s is not a partition bucket" % row[1])
+                self.assertIn(row[2], ("", "inherited", "wait_oncpu"))
+                if len(row) == 8 and row[7]:
+                    # must parse as `expect` options, or the row is dead
+                    args = ["expect", "gt", "hitch", "--class", row[0],
+                            "--bucket", row[1] or "oncpu"] + row[7].split()
+                    ch.build_parser().parse_args(args)
+
+    def test_the_expected_bucket_of_every_class(self):
+        expect = {"sleep": "block_timer", "worker_block": "block_futex",
+                  "worker_cpu": "block_futex", "cpu_spike": "oncpu",
+                  "preempt": "runnable", "thousand_cuts": "block_timer",
+                  "io": "block_io", "poll": "block_poll",
+                  "fault": "oncpu_fault"}
+        for cls, bucket in expect.items():
+            with self.subTest(cls=cls):
+                self.assertIn(cls, self.by_class)
+                self.assertEqual(ch.normalize_bucket(self.by_class[cls][1]),
+                                 bucket)
+        self.assertEqual(self.by_class["quiet_baseline"][1], "")
+
+    def test_the_worker_classes_differ_by_resolution(self):
+        # both wait on the same condvar; what tells them apart is the waker
+        self.assertEqual(self.by_class["worker_block"][2], "inherited")
+        self.assertEqual(self.by_class["worker_cpu"][2], "wait_oncpu")
+
+    def test_the_worker_thread_check_takes_every_name_its_wait_can_take(self):
+        args = self.by_class["worker_block"][5].split()
+        self.assertIn("--thread", args)
+        self.assertIn("hb_worker", args)
+        names = args[args.index("--bucket-any") + 1].split(",")
+        self.assertEqual([ch.normalize_bucket(b) for b in names],
+                         ["block_task", "block_futex", "block_timer"])
+
+    def test_the_new_classes_run_like_the_others(self):
+        for cls in ("poll", "fault"):
+            with self.subTest(cls=cls):
+                row = self.by_class[cls]
+                self.assertEqual(row[4], self.by_class["io"][4])  # min-frames
+                self.assertEqual(row[6], "-c %s" % cls)
+
+    def test_the_invariant_check_weighs_the_carve_outs(self):
+        with open(SPEC_PATH, encoding="utf-8") as f:
+            script = f.read()
+        self.assertIn("check invariant", script)
+        line = [ln for ln in script.splitlines() if "check invariant" in ln][0]
+        self.assertIn("--oncpu-stall", line)
+
+
+class AnySizeTest(CliTest):
+    """A cause that shares its frame with unavoidable work (e.g. faults)."""
+
+    def _scene(self):
+        # the fault class: on-CPU work dominates, fault time is still the story
+        frames = [gt_frame(1, injected="fault", expect="HT_ONCPU_FAULT",
+                           frame_ns=40_000_000)]
+        recs = [record(1, causes(oncpu=16_000_000, oncpu_fault=13_000_000,
+                                 block_timer=11_000_000),
+                       worst_cause="block_timer", frame_ns=40_000_000)]
+        return self.files(frames, recs)
+
+    def test_largest_required_by_default(self):
+        gt, hitch = self._scene()
+        self.assertFail(["expect", gt, hitch, "--class", "fault",
+                         "--bucket", "HT_ONCPU_FAULT", "--min-frac", "0.3"],
+                        "wrong bucket")
+
+    def test_any_size_accepts_a_non_largest_bucket(self):
+        gt, hitch = self._scene()
+        text = self.assertPass(["expect", gt, hitch, "--class", "fault",
+                                "--bucket", "HT_ONCPU_FAULT",
+                                "--min-frac", "0.3", "--any-size"])
+        self.assertIn("carrying", text)
+
+    def test_any_size_still_enforces_min_frac(self):
+        gt, hitch = self._scene()
+        self.assertFail(["expect", gt, hitch, "--class", "fault",
+                         "--bucket", "HT_ONCPU_FAULT", "--min-frac", "0.9",
+                         "--any-size"], "below --min-frac")
 
 
 if __name__ == "__main__":

@@ -29,7 +29,9 @@
 #	over-budget frame to OUT.jsonl (appends: the file is removed first).
 #
 # Environment overrides:
-#   TRACE_SECS   seconds hitchtrace traces (default 6)
+#   TRACE_SECS   seconds hitchtrace traces (default 5, which keeps the whole
+#                table near the wall-clock time it took before the poll and
+#                fault classes joined it; a class still sees ~300 frames)
 #   BENCH_SECS   hitchbench lifetime (default TRACE_SECS + 3; it must outlive
 #                hitchtrace so the uprobe target stays mapped)
 #   WARMUP_SECS  delay between hitchbench being up and hitchtrace starting
@@ -42,7 +44,9 @@
 #                only 1/8 under budget, so on a busy machine some normal
 #                frames really do overrun; each quiet check prints that rate
 #                from the ground truth next to its own verdict.
-#   TOL_US       partition tolerance for the invariant check
+#   TOL_US       partition tolerance for the invariant check, which also
+#                weighs the on-CPU stall buckets against the frame
+#                (check_hitches.py invariant --oncpu-stall)
 #   BUDGET_US    frame budget, overriding what hitchbench reports
 #   CLASSES      space-separated class list, overriding the table below
 #   HITCHBENCH_ARGS, HITCHTRACE_ARGS   extra arguments (e.g. -i N to inject
@@ -59,7 +63,7 @@ HITCHBENCH=${HITCHBENCH:-$ROOT/build/hitchbench}
 CHECK_PY=${CHECK_PY:-$ROOT/tests/check_hitches.py}
 OUT=$ROOT/tests/out
 
-TRACE_SECS=${TRACE_SECS:-6}
+TRACE_SECS=${TRACE_SECS:-5}
 BENCH_SECS=${BENCH_SECS:-$((TRACE_SECS + 3))}
 WARMUP_SECS=${WARMUP_SECS:-1}
 MIN_FRAC=${MIN_FRAC:-0.5}
@@ -80,9 +84,11 @@ read -r -a EXTRA_TRACE_ARGS <<<"${HITCHTRACE_ARGS:-}"
 # `name` is both the test name and the injector class the ground truth
 # reports; `bucket` is the partition bucket the injected stall must land in
 # and be the largest of, and an empty `bucket` runs only the quiet and
-# invariant checks. `resolved` is inherited/wait_oncpu (how HT_BLOCK_TASK must
-# be explained) and `chain` a comma-separated list of hop comms, direct waker
-# first. `thread checks` are arguments to `check_hitches.py threads`, which
+# invariant checks. `resolved` is inherited/wait_oncpu (how the time the root
+# spent blocked must be explained: any wait a task ended is resolved through
+# that waker, whichever HT_BLOCK_* bucket the wait itself landed in), and
+# `chain` a comma-separated list of hop comms, direct waker first.
+# `thread checks` are arguments to `check_hitches.py threads`, which
 # asserts the record's per-thread detail (struct ht_thread) rather than the
 # root's own timeline; an empty field skips that check, and --class and
 # --min-frames are added from this row. The classes and their
@@ -90,20 +96,34 @@ read -r -a EXTRA_TRACE_ARGS <<<"${HITCHTRACE_ARGS:-}"
 # `build/hitchbench -l`); the bucket names are enum ht_cause from
 # src/hitchtrace.h.
 #
+# Both worker classes have the root waiting on a condvar, so the root's own
+# wait is a futex wait (HT_BLOCK_FUTEX) whichever way the worker is stalled;
+# what tells them apart is the resolution, inherited for a worker that was
+# itself blocked and wait_oncpu for one that was merely computing.
+#
+# The fault class never leaves the CPU: its frame is on-CPU from end to end,
+# and what makes it a hitch is the share of that time spent in minor page
+# faults, which frame close carves out of HT_ONCPU into HT_ONCPU_FAULT. The
+# invariant check below weighs those carve-outs against the frame.
+#
 # The two classes with a thread check are the ones where the per-thread view
 # says something the record alone does not: in worker_block the frame's stall
-# belongs to hb_worker, which blocks on the feeder's pipe (HT_BLOCK_TASK, or
-# HT_BLOCK_TIMER when the wake is credited to the hrtimer that started the
-# chain, so either answers), and in preempt the root is runnable while the
-# pinned hogs hold the CPU, which only the preemptor field names.
+# belongs to hb_worker, which blocks on the feeder's pipe, and the rules name
+# that wait after whatever ended it -- HT_BLOCK_TASK for the feeder's write,
+# HT_BLOCK_FUTEX or HT_BLOCK_TIMER when the wake is credited to the futex the
+# worker parks on or to the hrtimer that started the chain, so any of the
+# three answers. In preempt the root is runnable while the pinned hogs hold
+# the CPU, which only the preemptor field names.
 CLASS_SPECS=(
 	"sleep|HT_BLOCK_TIMER|||$MIN_FRAMES||-c sleep"
-	"worker_block|HT_BLOCK_TASK|inherited|hb_worker,hb_feeder|$MIN_FRAMES|--thread hb_worker --bucket-any HT_BLOCK_TASK,HT_BLOCK_TIMER --min-frac $MIN_FRAC|-c worker_block"
-	"worker_cpu|HT_BLOCK_TASK|wait_oncpu|hb_worker|$MIN_FRAMES||-c worker_cpu"
+	"worker_block|HT_BLOCK_FUTEX|inherited|hb_worker,hb_feeder|$MIN_FRAMES|--thread hb_worker --bucket-any HT_BLOCK_TASK,HT_BLOCK_FUTEX,HT_BLOCK_TIMER --min-frac $MIN_FRAC|-c worker_block"
+	"worker_cpu|HT_BLOCK_FUTEX|wait_oncpu|hb_worker|$MIN_FRAMES||-c worker_cpu"
 	"cpu_spike|HT_ONCPU|||$MIN_FRAMES||-c cpu_spike"
 	"preempt|HT_RUNNABLE|||$MIN_FRAMES|--thread hb_root --preemptor hb_hog|-c preempt"
 	"thousand_cuts|HT_BLOCK_TIMER|||$MIN_FRAMES||-c thousand_cuts"
 	"io|HT_BLOCK_IO|||$MIN_FRAMES||-c io"
+	"poll|HT_BLOCK_POLL|||$MIN_FRAMES||-c poll"
+	"fault|HT_ONCPU_FAULT|||$MIN_FRAMES||-c fault|--any-size --min-frac 0.30"
 	"quiet_baseline||||||-i 0"
 )
 
@@ -388,11 +408,12 @@ run_hitchtrace() {
 
 # ------------------------------------------------------------------ tests
 
-# run_class NAME BUCKET RESOLVED CHAIN MIN_FRAMES THREAD_ARGS BENCH_ARGS
+# run_class NAME BUCKET RESOLVED CHAIN MIN_FRAMES THREAD_ARGS BENCH_ARGS EXPECT_ARGS
 run_class() {
 	local cls=$1 bucket=$2 resolved=$3 chain=$4 min_frames=$5 threads=$6
+	local extra_expect=${8:-}
 	local gt="$OUT/$cls.gt.jsonl" hitch="$OUT/$cls.hitch.jsonl"
-	local bench_args thread_args args=()
+	local bench_args thread_args extra_args args=()
 
 	read -r -a bench_args <<<"$7"
 	start_bench "${bench_args[@]}" || return
@@ -417,6 +438,10 @@ run_class() {
 		      --min-frac "$MIN_FRAC" --min-frames "${min_frames:-$MIN_FRAMES}")
 		[[ -n $resolved ]] && args+=(--resolved "$resolved")
 		[[ -n $chain ]] && args+=(--chain "$chain")
+		if [[ -n $extra_expect ]]; then
+			read -r -a extra_args <<<"$extra_expect"
+			args+=("${extra_args[@]}")
+		fi
 		check "${args[@]}"
 	fi
 	if [[ -n $threads ]]; then
@@ -428,7 +453,7 @@ run_class() {
 	args=(quiet "$gt" "$hitch" --max-false "$MAX_FALSE")
 	[[ -n $BENCH_BUDGET_US ]] && args+=(--budget-us "$BENCH_BUDGET_US")
 	check "${args[@]}"
-	check invariant "$hitch" --tol-us "$TOL_US"
+	check invariant "$hitch" --tol-us "$TOL_US" --oncpu-stall
 }
 
 # ------------------------------------------------------------------- main
@@ -439,10 +464,10 @@ for cls in "${SELECTED[@]}"; do
 	for spec in "${CLASS_SPECS[@]}"; do
 		[[ ${spec%%|*} == "$cls" ]] || continue
 		IFS='|' read -r c_name c_bucket c_resolved c_chain c_min \
-			c_threads c_args <<<"$spec"
+			c_threads c_args c_extra <<<"$spec"
 		t_begin "$c_name"
 		run_class "$c_name" "$c_bucket" "$c_resolved" "$c_chain" \
-			"$c_min" "$c_threads" "$c_args"
+			"$c_min" "$c_threads" "$c_args" "$c_extra"
 		t_end
 		break
 	done

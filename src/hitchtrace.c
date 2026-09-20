@@ -14,6 +14,7 @@
  *                   [-d SECONDS] [-q] [-v] [--min-stall US] [--hops N]
  */
 #include <argp.h>
+#include <assert.h>
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
@@ -186,31 +187,83 @@ static double ms(__u64 ns)
 
 /* ---- naming ------------------------------------------------------------ */
 
+/*
+ * The buckets of enum ht_cause and the keys they carry in the JSON, in enum
+ * order. Listed once here: the array and the coverage check below are both
+ * built from this, so a bucket added to the enum without a name is a build
+ * error rather than a null key in the output.
+ */
+#define HT_CAUSE_LIST(X)						\
+	X(HT_ONCPU,			"oncpu")			\
+	X(HT_ONCPU_FAULT,		"oncpu_fault")			\
+	X(HT_ONCPU_FAULT_MAJOR,		"oncpu_fault_major")		\
+	X(HT_ONCPU_RECLAIM,		"oncpu_reclaim")		\
+	X(HT_ONCPU_COMPACT,		"oncpu_compact")		\
+	X(HT_RUNNABLE,			"runnable")			\
+	X(HT_RUNQUEUE,			"runqueue")			\
+	X(HT_BLOCK_FUTEX,		"block_futex")			\
+	X(HT_BLOCK_POLL,		"block_poll")			\
+	X(HT_BLOCK_IO,			"block_io")			\
+	X(HT_BLOCK_TIMER,		"block_timer")			\
+	X(HT_BLOCK_GPU,			"block_gpu")			\
+	X(HT_BLOCK_PRESENT,		"block_present")		\
+	X(HT_BLOCK_TASK,		"block_task")			\
+	X(HT_BLOCK_OTHER,		"block_other")			\
+	X(HT_RESOLVED_WAIT_ONCPU,	"resolved_wait_oncpu")		\
+	X(HT_RESOLVED_INHERITED,	"resolved_inherited")
+
+#define HT_CAUSE_NAME(cause, name)	[cause] = name,
+#define HT_CAUSE_ONE(cause, name)	+ 1
+
 static const char *const cause_names[HT_CAUSE_MAX] = {
-	[HT_ONCPU] = "oncpu",
-	[HT_RUNNABLE] = "runnable",
-	[HT_RUNQUEUE] = "runqueue",
-	[HT_BLOCK_TASK] = "block_task",
-	[HT_BLOCK_IO] = "block_io",
-	[HT_BLOCK_TIMER] = "block_timer",
-	[HT_BLOCK_OTHER] = "block_other",
-	[HT_RESOLVED_WAIT_ONCPU] = "resolved_wait_oncpu",
-	[HT_RESOLVED_INHERITED] = "resolved_inherited",
+	HT_CAUSE_LIST(HT_CAUSE_NAME)
 };
+
+static_assert(0 HT_CAUSE_LIST(HT_CAUSE_ONE) == HT_CAUSE_MAX,
+	      "cause_names[] does not name every bucket of enum ht_cause");
+
+/*
+ * The two runs of buckets the human block renders under one total: the
+ * on-CPU time with its kernel stalls carved out, and the blocked time.
+ */
+#define HT_ONCPU_LAST	HT_ONCPU_COMPACT
+#define HT_BLOCK_FIRST	HT_BLOCK_FUTEX
+#define HT_BLOCK_LAST	HT_BLOCK_OTHER
+
+static_assert(HT_ONCPU_LAST + 1 == HT_RUNNABLE &&
+	      HT_BLOCK_LAST + 1 == HT_CAUSE_PARTITION,
+	      "the on-CPU and blocked buckets are no longer contiguous");
 
 /* Human phrasing of what a thread was doing, used when there is no stack. */
 static const char *cause_phrase(__u32 cause)
 {
 	switch (cause) {
-	case HT_ONCPU:		return "running";
-	case HT_RUNNABLE:	return "preempted, runnable";
-	case HT_RUNQUEUE:	return "waiting for a CPU";
-	case HT_BLOCK_TASK:	return "blocked on a task";
-	case HT_BLOCK_IO:	return "blocked on I/O";
-	case HT_BLOCK_TIMER:	return "sleeping on a timer";
-	case HT_BLOCK_OTHER:	return "blocked";
-	default:		return "unknown";
+	case HT_ONCPU:			return "running";
+	case HT_ONCPU_FAULT:		return "running, in a page fault";
+	case HT_ONCPU_FAULT_MAJOR:	return "running, in a major fault";
+	case HT_ONCPU_RECLAIM:		return "running, in reclaim";
+	case HT_ONCPU_COMPACT:		return "running, in compaction";
+	case HT_RUNNABLE:		return "preempted, runnable";
+	case HT_RUNQUEUE:		return "waiting for a CPU";
+	case HT_BLOCK_FUTEX:		return "blocked on a futex";
+	case HT_BLOCK_POLL:		return "blocked in poll";
+	case HT_BLOCK_IO:		return "blocked on I/O";
+	case HT_BLOCK_TIMER:		return "sleeping on a timer";
+	case HT_BLOCK_GPU:		return "waiting on a GPU fence";
+	case HT_BLOCK_PRESENT:		return "blocked in present";
+	case HT_BLOCK_TASK:		return "blocked on a task";
+	case HT_BLOCK_OTHER:		return "blocked";
+	default:			return "unknown";
 	}
+}
+
+/* A bucket without its group prefix, for a line the group already names. */
+static const char *short_name(__u32 cause)
+{
+	const char *name = cause_names[cause];
+	const char *sep = strchr(name, '_');
+
+	return sep ? sep + 1 : name;
 }
 
 /* bit position -> name, for the JSON flag lists */
@@ -356,9 +409,27 @@ static bool is_scheduler_frame(const char *name)
 }
 
 /*
+ * The plumbing a wait sits in below the call that asked for it. "futex_wait"
+ * only says the thread waited; its caller says what for, so these are skipped
+ * like the scheduler frames above.
+ */
+static bool is_wait_wrapper(const char *name)
+{
+	static const char *const prefixes[] = {
+		"futex_wait", "futex_do_wait", "do_futex",
+		"do_epoll_wait", "do_select",
+	};
+
+	for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
+		if (has_prefix(name, prefixes[i]))
+			return true;
+	return false;
+}
+
+/*
  * What the blocking stack was waiting in: the first frame from the leaf that
- * is neither the tracer nor a scheduler wrapper. If the stack is nothing but
- * wrappers, the innermost wrapper is still better than nothing.
+ * is neither the tracer nor a wrapper. If the stack is nothing but wrappers,
+ * the innermost wrapper is still better than nothing.
  */
 static const char *blocked_in(__s32 kstack_id)
 {
@@ -372,7 +443,7 @@ static const char *blocked_in(__s32 kstack_id)
 
 		if (is_tracing_frame(name))
 			continue;
-		if (is_scheduler_frame(name)) {
+		if (is_scheduler_frame(name) || is_wait_wrapper(name)) {
 			if (!fallback)
 				fallback = name;
 			continue;
@@ -385,6 +456,56 @@ static const char *blocked_in(__s32 kstack_id)
 }
 
 /* ---- human-readable output --------------------------------------------- */
+
+/* snprintf that appends, keeping *len in step and dropping what does not fit */
+static void append(char *buf, size_t sz, size_t *len, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (*len + 1 >= sz)
+		return;
+	va_start(ap, fmt);
+	n = vsnprintf(buf + *len, sz - *len, fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return;
+	*len = (size_t)n < sz - *len ? *len + (size_t)n : sz - 1;
+}
+
+/* Time one timeline spent in the buckets [first, last]. */
+static __u64 sum_causes(const __u64 *cause_ns, __u32 first, __u32 last)
+{
+	__u64 ns = 0;
+
+	for (__u32 i = first; i <= last; i++)
+		ns += cause_ns[i];
+	return ns;
+}
+
+/*
+ * The buckets of [first, last] that hold time, as "name 1.2" joined by sep,
+ * to be printed under a total the caller has already named. A bucket holding
+ * the whole of that total is named without repeating the figure; a range with
+ * nothing in it yields an empty string.
+ */
+static void bucket_list(char *buf, size_t sz, const __u64 *cause_ns,
+			__u32 first, __u32 last, const char *sep, __u64 total)
+{
+	size_t len = 0;
+
+	buf[0] = '\0';
+	for (__u32 i = first; i <= last; i++) {
+		if (!cause_ns[i])
+			continue;
+		if (cause_ns[i] == total) {
+			append(buf, sz, &len, "%s", short_name(i));
+			return;
+		}
+		append(buf, sz, &len, "%s%s %.1f", len ? sep : "",
+		       short_name(i), ms(cause_ns[i]));
+	}
+}
 
 static bool hop_is_irq(const struct ht_hop *h)
 {
@@ -506,37 +627,17 @@ static void frame_flags_str(char *buf, size_t sz, __u32 flags)
 
 #define THREAD_LINES	8	/* thread lines printed per record */
 
-/* snprintf that appends, keeping *len in step and dropping what does not fit */
-static void append(char *buf, size_t sz, size_t *len, const char *fmt, ...)
-{
-	va_list ap;
-	int n;
-
-	if (*len + 1 >= sz)
-		return;
-	va_start(ap, fmt);
-	n = vsnprintf(buf + *len, sz - *len, fmt, ap);
-	va_end(ap);
-	if (n < 0)
-		return;
-	*len = (size_t)n < sz - *len ? *len + (size_t)n : sz - 1;
-}
-
 /*
- * Off-CPU time of one thread inside the frame window: every bucket but
- * on-CPU. This orders the lines; it is never added to the frame, which only
- * the root's timeline partitions. open_ns is deliberately left out: a thread
- * that slept through the whole frame has nothing but open time, and it is
- * context rather than the frame's problem. It is still printed, last.
+ * Off-CPU time of one thread inside the frame window: every bucket that is
+ * not on-CPU time, so not the kernel stalls carved out of it either. This
+ * orders the lines; it is never added to the frame, which only the root's
+ * timeline partitions. open_ns is deliberately left out: a thread that slept
+ * through the whole frame has nothing but open time, and it is context rather
+ * than the frame's problem. It is still printed, last.
  */
 static __u64 thread_offcpu_ns(const struct ht_thread *t)
 {
-	__u64 ns = 0;
-
-	for (__u32 i = 0; i < HT_CAUSE_PARTITION; i++)
-		if (i != HT_ONCPU)
-			ns += t->cause_ns[i];
-	return ns;
+	return sum_causes(t->cause_ns, HT_RUNNABLE, HT_BLOCK_LAST);
 }
 
 /* A thread the frame never scheduled has nothing to say about it. */
@@ -586,14 +687,34 @@ static __u32 thread_order(const struct ht_record *r, __u32 *idx)
 /* The buckets a thread spent time in, then what stands out about its frame. */
 static void thread_detail(char *buf, size_t sz, const struct ht_thread *t)
 {
+	__u64 oncpu = sum_causes(t->cause_ns, HT_ONCPU, HT_ONCPU_LAST);
+	__u64 blocked = sum_causes(t->cause_ns, HT_BLOCK_FIRST, HT_BLOCK_LAST);
+	char sub[160];
 	const char *where;
 	size_t len = 0;
 
 	buf[0] = '\0';
-	for (__u32 i = 0; i < HT_CAUSE_PARTITION; i++)
+	if (oncpu) {
+		bucket_list(sub, sizeof(sub), t->cause_ns, HT_ONCPU + 1,
+			    HT_ONCPU_LAST, ", ", oncpu);
+		append(buf, sz, &len, "oncpu %.1f", ms(oncpu));
+		if (sub[0])
+			append(buf, sz, &len, " (%s)", sub);
+	}
+	for (__u32 i = HT_RUNNABLE; i <= HT_RUNQUEUE; i++)
 		if (t->cause_ns[i])
 			append(buf, sz, &len, "%s%s %.1f", len ? "  " : "",
 			       cause_names[i], ms(t->cause_ns[i]));
+	/*
+	 * The carve-outs above are part of the on-CPU total, so they are
+	 * parenthesized; the blocked buckets add up to their own total.
+	 */
+	if (blocked) {
+		bucket_list(sub, sizeof(sub), t->cause_ns, HT_BLOCK_FIRST,
+			    HT_BLOCK_LAST, " | ", blocked);
+		append(buf, sz, &len, "%sblocked %.1f %s", len ? "  " : "",
+		       ms(blocked), sub);
+	}
 	/* HT_THREAD_BLOCKED_END: the tail of an interval the frame outlived */
 	if (t->open_ns)
 		append(buf, sz, &len, "%s(still blocked at frame end %.1f ms)",
@@ -664,10 +785,52 @@ static void print_threads(const struct ht_record *r)
 		       HT_MAX_THREADS);
 }
 
+/*
+ * How the frame's time went, in two or three short lines: the root's on-CPU
+ * time with the kernel stalls carved out of it, the blocked time under its
+ * total, and what the waits resolved to. A bucket nothing was spent in is
+ * left out; the on-CPU line stays when the frame has nothing else to show.
+ */
+static void print_timeline(const struct ht_record *r)
+{
+	const __u64 *c = r->cause_ns;
+	__u64 oncpu = sum_causes(c, HT_ONCPU, HT_ONCPU_LAST);
+	__u64 blocked = sum_causes(c, HT_BLOCK_FIRST, HT_BLOCK_LAST);
+	char sub[160], buf[160];
+	size_t len = 0;
+
+	if (oncpu || c[HT_RUNNABLE] || c[HT_RUNQUEUE] || !blocked) {
+		bucket_list(sub, sizeof(sub), c, HT_ONCPU + 1, HT_ONCPU_LAST,
+			    ", ", oncpu);
+		printf("  oncpu   %6.1f ms", ms(oncpu));
+		if (sub[0])
+			printf("  (%s)", sub);
+		if (c[HT_RUNNABLE])
+			printf("   runnable %.1f ms", ms(c[HT_RUNNABLE]));
+		if (c[HT_RUNQUEUE])
+			printf("   runqueue %.1f ms", ms(c[HT_RUNQUEUE]));
+		printf("\n");
+	}
+	if (blocked) {
+		bucket_list(sub, sizeof(sub), c, HT_BLOCK_FIRST, HT_BLOCK_LAST,
+			    " | ", blocked);
+		printf("  blocked %6.1f ms  %s\n", ms(blocked), sub);
+	}
+	if (c[HT_RESOLVED_WAIT_ONCPU] || c[HT_RESOLVED_INHERITED]) {
+		buf[0] = '\0';
+		if (c[HT_RESOLVED_WAIT_ONCPU])
+			append(buf, sizeof(buf), &len,
+			       "waiting on a running task %.1f ms",
+			       ms(c[HT_RESOLVED_WAIT_ONCPU]));
+		if (c[HT_RESOLVED_INHERITED])
+			append(buf, sizeof(buf), &len, "%sinherited stalls %.1f ms",
+			       len ? ", " : "", ms(c[HT_RESOLVED_INHERITED]));
+		printf("  resolved   %s\n", buf);
+	}
+}
+
 static void print_record(const struct ht_record *r)
 {
-	__u64 blocked = r->cause_ns[HT_BLOCK_TASK] + r->cause_ns[HT_BLOCK_IO] +
-			r->cause_ns[HT_BLOCK_TIMER] + r->cause_ns[HT_BLOCK_OTHER];
 	__u64 over = r->frame_ns > r->budget_ns ? r->frame_ns - r->budget_ns : 0;
 	char root[TASK_COMM_LEN + 24], flags[80];
 	const char *where;
@@ -677,18 +840,7 @@ static void print_record(const struct ht_record *r)
 	printf("hitch frame %llu  %.1f ms  (budget %.1f ms, over by %.1f ms)  root %s%s\n",
 	       (unsigned long long)r->frame_id, ms(r->frame_ns), ms(r->budget_ns),
 	       ms(over), root, flags);
-	printf("  oncpu %8.1f ms   runnable %5.1f ms   runqueue %4.1f ms\n",
-	       ms(r->cause_ns[HT_ONCPU]), ms(r->cause_ns[HT_RUNNABLE]),
-	       ms(r->cause_ns[HT_RUNQUEUE]));
-	printf("  blocked %6.1f ms   task %.1f ms | io %.1f | timer %.1f | other %.1f\n",
-	       ms(blocked), ms(r->cause_ns[HT_BLOCK_TASK]),
-	       ms(r->cause_ns[HT_BLOCK_IO]), ms(r->cause_ns[HT_BLOCK_TIMER]),
-	       ms(r->cause_ns[HT_BLOCK_OTHER]));
-	if (r->cause_ns[HT_RESOLVED_WAIT_ONCPU] || r->cause_ns[HT_RESOLVED_INHERITED])
-		printf("  resolved   waiting on a running task %.1f ms, "
-		       "inherited stalls %.1f ms\n",
-		       ms(r->cause_ns[HT_RESOLVED_WAIT_ONCPU]),
-		       ms(r->cause_ns[HT_RESOLVED_INHERITED]));
+	print_timeline(r);
 
 	if (r->worst.ns) {
 		where = blocked_in(r->worst.kstack_id);

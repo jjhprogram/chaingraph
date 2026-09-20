@@ -29,6 +29,24 @@
 #define PF_USER_WORKER	0x00004000
 #define PF_KTHREAD	0x00200000
 
+#define VM_FAULT_MAJOR	0x000004
+
+/* x86_64 syscall numbers we care about */
+#define SYS_read	0
+#define SYS_write	1
+#define SYS_poll	7
+#define SYS_select	23
+#define SYS_nanosleep	35
+#define SYS_futex	202
+#define SYS_epoll_wait	232
+#define SYS_clock_nanosleep	230
+#define SYS_pselect6	270
+#define SYS_ppoll	271
+#define SYS_epoll_pwait	281
+#define SYS_epoll_pwait2	441
+#define SYS_futex_waitv	449
+#define SYS_futex_wait	455
+
 #define SOFTIRQ_OFFSET	0x00000100
 #define HARDIRQ_MASK	0x000f0000
 #define NMI_MASK	0x00f00000
@@ -71,6 +89,19 @@ struct task_state {
 	__u32 depth;		/* valid entries in links[] */
 	__u32 seq;		/* odd while links[] is being rewritten */
 	__u32 slot1;		/* per-thread record slot, 1-based; 0 = none */
+	__u32 sysclass;		/* HT_SC_*, while inside a syscall */
+	__u32 gpu_depth;	/* nested GPU fence waits */
+	__u64 fault_start;	/* on-CPU kernel stalls, cumulative */
+	__u64 fault_ns;
+	__u64 fault_major_ns;
+	__u64 reclaim_start;
+	__u64 reclaim_ns;
+	__u64 compact_start;
+	__u64 compact_ns;
+	__u64 snap_fault;	/* their values when this frame opened */
+	__u64 snap_fault_major;
+	__u64 snap_reclaim;
+	__u64 snap_compact;
 	__u32 preempt_pid;	/* who took the CPU at the last preemption */
 	__u32 preempt_tgid;
 	char preempt_comm[TASK_COMM_LEN];
@@ -141,6 +172,10 @@ struct thread_slot {
 	__u32 epoch;
 	__u32 __pad;
 	__u64 out_ts;		/* set while the thread is off-CPU */
+	__u64 snap_fault;	/* the thread's on-CPU stall counters ... */
+	__u64 snap_fault_major;	/* ... when this frame opened, so the frame's */
+	__u64 snap_reclaim;	/* share can be carved out of its on-CPU time */
+	__u64 snap_compact;
 	struct ht_thread th;
 };
 
@@ -342,10 +377,37 @@ static __always_inline struct thread_slot *slot_of(struct task_state *ts,
 		 * is off-CPU stays off-CPU across the boundary */
 		__builtin_memset(&s->th, 0, sizeof(s->th));
 		s->epoch = epoch;
+		s->snap_fault = ts->fault_ns;
+		s->snap_fault_major = ts->fault_major_ns;
+		s->snap_reclaim = ts->reclaim_ns;
+		s->snap_compact = ts->compact_ns;
 	}
 	s->th.pid = t->pid;
 	__builtin_memcpy(s->th.comm, t->comm, TASK_COMM_LEN);
 	return s;
+}
+
+static __always_inline __u32 sysclass_of(long nr)
+{
+	switch (nr) {
+	case SYS_futex:
+	case SYS_futex_waitv:
+	case SYS_futex_wait:
+		return HT_SC_FUTEX;
+	case SYS_poll:
+	case SYS_ppoll:
+	case SYS_select:
+	case SYS_pselect6:
+	case SYS_epoll_wait:
+	case SYS_epoll_pwait:
+	case SYS_epoll_pwait2:
+		return HT_SC_POLL;
+	case SYS_nanosleep:
+	case SYS_clock_nanosleep:
+		return HT_SC_SLEEP;
+	default:
+		return HT_SC_NONE;
+	}
 }
 
 static __always_inline bool in_target(struct task_struct *t)
@@ -447,6 +509,197 @@ static __always_inline int record_wakeup(void *ctx, struct task_struct *p)
 	return 0;
 }
 
+/*
+ * Which syscall a thread is inside, so a blocked interval can be named by
+ * what the thread asked for rather than by who happened to wake it.
+ */
+SEC("raw_tp/sys_enter")
+int BPF_PROG(on_sys_enter, struct pt_regs *regs, long id)
+{
+	struct task_struct *cur = bpf_get_current_task_btf();
+	struct task_state *ts;
+
+	if (!in_target(cur))
+		return 0;
+	ts = bpf_task_storage_get(&task_states, cur, NULL,
+				  BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (ts)
+		ts->sysclass = sysclass_of(id);
+	return 0;
+}
+
+SEC("raw_tp/sys_exit")
+int BPF_PROG(on_sys_exit, struct pt_regs *regs, long ret)
+{
+	struct task_struct *cur = bpf_get_current_task_btf();
+	struct task_state *ts;
+
+	if (!in_target(cur))
+		return 0;
+	ts = bpf_task_storage_get(&task_states, cur, NULL, 0);
+	if (ts)
+		ts->sysclass = HT_SC_NONE;
+	return 0;
+}
+
+/* GPU fence waits. RADV waits through the syncobj ioctls, not dma_fence. */
+static __always_inline int gpu_enter(void)
+{
+	struct task_struct *cur = bpf_get_current_task_btf();
+	struct task_state *ts;
+
+	if (!in_target(cur))
+		return 0;
+	ts = bpf_task_storage_get(&task_states, cur, NULL,
+				  BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (ts)
+		ts->gpu_depth++;
+	return 0;
+}
+
+static __always_inline int gpu_leave(void)
+{
+	struct task_struct *cur = bpf_get_current_task_btf();
+	struct task_state *ts;
+
+	if (!in_target(cur))
+		return 0;
+	ts = bpf_task_storage_get(&task_states, cur, NULL, 0);
+	if (ts && ts->gpu_depth)
+		ts->gpu_depth--;
+	return 0;
+}
+
+SEC("fentry/dma_fence_wait_timeout")
+int BPF_PROG(on_fence_enter) { return gpu_enter(); }
+
+SEC("fexit/dma_fence_wait_timeout")
+int BPF_PROG(on_fence_leave) { return gpu_leave(); }
+
+SEC("fentry/drm_syncobj_wait_ioctl")
+int BPF_PROG(on_syncobj_enter) { return gpu_enter(); }
+
+SEC("fexit/drm_syncobj_wait_ioctl")
+int BPF_PROG(on_syncobj_leave) { return gpu_leave(); }
+
+SEC("fentry/drm_syncobj_timeline_wait_ioctl")
+int BPF_PROG(on_syncobj_tl_enter) { return gpu_enter(); }
+
+SEC("fexit/drm_syncobj_timeline_wait_ioctl")
+int BPF_PROG(on_syncobj_tl_leave) { return gpu_leave(); }
+
+/* On-CPU kernel stalls: page faults, reclaim, compaction. */
+SEC("fentry/handle_mm_fault")
+int BPF_PROG(on_fault_enter, struct vm_area_struct *vma, unsigned long address,
+	     unsigned int flags, struct pt_regs *regs)
+{
+	struct task_struct *cur = bpf_get_current_task_btf();
+	struct task_state *ts;
+
+	if (!in_target(cur))
+		return 0;
+	ts = bpf_task_storage_get(&task_states, cur, NULL,
+				  BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (ts && !ts->fault_start)
+		ts->fault_start = bpf_ktime_get_ns();
+	return 0;
+}
+
+SEC("fexit/handle_mm_fault")
+int BPF_PROG(on_fault_leave, struct vm_area_struct *vma, unsigned long address,
+	     unsigned int flags, struct pt_regs *regs, unsigned int ret)
+{
+	struct task_struct *cur = bpf_get_current_task_btf();
+	struct task_state *ts;
+	__u64 delta;
+
+	if (!in_target(cur))
+		return 0;
+	ts = bpf_task_storage_get(&task_states, cur, NULL, 0);
+	if (!ts || !ts->fault_start)
+		return 0;
+	delta = bpf_ktime_get_ns() - ts->fault_start;
+	ts->fault_start = 0;
+	if (ret & VM_FAULT_MAJOR)
+		ts->fault_major_ns += delta;
+	else
+		ts->fault_ns += delta;
+	return 0;
+}
+
+static __always_inline int reclaim_enter(void)
+{
+	struct task_struct *cur = bpf_get_current_task_btf();
+	struct task_state *ts;
+
+	if (!in_target(cur))
+		return 0;
+	ts = bpf_task_storage_get(&task_states, cur, NULL,
+				  BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (ts && !ts->reclaim_start)
+		ts->reclaim_start = bpf_ktime_get_ns();
+	return 0;
+}
+
+static __always_inline int reclaim_leave(void)
+{
+	struct task_struct *cur = bpf_get_current_task_btf();
+	struct task_state *ts;
+
+	if (!in_target(cur))
+		return 0;
+	ts = bpf_task_storage_get(&task_states, cur, NULL, 0);
+	if (ts && ts->reclaim_start) {
+		ts->reclaim_ns += bpf_ktime_get_ns() - ts->reclaim_start;
+		ts->reclaim_start = 0;
+	}
+	return 0;
+}
+
+SEC("tp_btf/mm_vmscan_direct_reclaim_begin")
+int BPF_PROG(on_reclaim_begin) { return reclaim_enter(); }
+
+SEC("tp_btf/mm_vmscan_direct_reclaim_end")
+int BPF_PROG(on_reclaim_end) { return reclaim_leave(); }
+
+/* MemoryMax/memory.high reclaim goes through the memcg tracepoints instead */
+SEC("tp_btf/mm_vmscan_memcg_reclaim_begin")
+int BPF_PROG(on_memcg_reclaim_begin) { return reclaim_enter(); }
+
+SEC("tp_btf/mm_vmscan_memcg_reclaim_end")
+int BPF_PROG(on_memcg_reclaim_end) { return reclaim_leave(); }
+
+SEC("tp_btf/mm_compaction_begin")
+int BPF_PROG(on_compact_begin)
+{
+	struct task_struct *cur = bpf_get_current_task_btf();
+	struct task_state *ts;
+
+	if (!in_target(cur))
+		return 0;
+	ts = bpf_task_storage_get(&task_states, cur, NULL,
+				  BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (ts && !ts->compact_start)
+		ts->compact_start = bpf_ktime_get_ns();
+	return 0;
+}
+
+SEC("tp_btf/mm_compaction_end")
+int BPF_PROG(on_compact_end)
+{
+	struct task_struct *cur = bpf_get_current_task_btf();
+	struct task_state *ts;
+
+	if (!in_target(cur))
+		return 0;
+	ts = bpf_task_storage_get(&task_states, cur, NULL, 0);
+	if (ts && ts->compact_start) {
+		ts->compact_ns += bpf_ktime_get_ns() - ts->compact_start;
+		ts->compact_start = 0;
+	}
+	return 0;
+}
+
 SEC("tp_btf/sched_waking")
 int BPF_PROG(on_waking, struct task_struct *p)
 {
@@ -460,11 +713,59 @@ int BPF_PROG(on_wakeup_new, struct task_struct *p)
 }
 
 /*
+ * What a blocked interval was waiting for. What the thread asked the kernel
+ * for beats who happened to wake it: a futex wait is a futex wait even when
+ * the waker is a timer interrupt firing its timeout.
+ */
+static __always_inline __u32 blocked_cause(struct task_state *ts, bool irq_waker,
+					   bool woken)
+{
+	if (ts->gpu_depth)
+		return HT_BLOCK_GPU;
+	if (ts->out_iowait)
+		return HT_BLOCK_IO;
+	switch (ts->sysclass) {
+	case HT_SC_FUTEX:
+		return HT_BLOCK_FUTEX;
+	case HT_SC_POLL:
+		return HT_BLOCK_POLL;
+	case HT_SC_SLEEP:
+		return HT_BLOCK_TIMER;
+	default:
+		break;
+	}
+	if (irq_waker)
+		return HT_BLOCK_TIMER;
+	if (woken)
+		return HT_BLOCK_TASK;
+	return HT_BLOCK_OTHER;
+}
+
+/* Move on-CPU time that was really a kernel stall into its own bucket. */
+static __always_inline void carve(__u64 *buckets, __u32 bucket, __u64 ns)
+{
+	__u64 on = buckets[HT_ONCPU];
+
+	if (!ns || bucket >= HT_CAUSE_PARTITION)
+		return;
+	if (ns > on)
+		ns = on;
+	buckets[HT_ONCPU] = on - ns;
+	buckets[bucket] += ns;
+}
+
+static __always_inline void carve_oncpu(struct task_state *ts, __u32 bucket,
+					__u64 ns)
+{
+	carve(ts->cause_ns, bucket, ns);
+}
+
+/*
  * Resolve a blocked interval [lo, hi) of the root through its wake chain and
  * record it as the frame's worst stall if it is the longest so far.
  */
 static __always_inline void resolve(struct task_state *ts, __u64 lo, __u64 hi,
-				    __u32 cause, __u64 blocked_ns)
+				    __u32 cause, __u64 blocked_ns, bool resolvable)
 {
 	struct ht_stall *w = &ts->worst;
 	__u64 prev_out = lo, prev_in = hi, inherited = 0;
@@ -478,7 +779,7 @@ static __always_inline void resolve(struct task_state *ts, __u64 lo, __u64 hi,
 	inherited = overlap(lo, hi, ts->links[0].w_out, ts->links[0].w_in);
 	if (ts->links[0].flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE))
 		inherited = 0;
-	if (cause == HT_BLOCK_TASK) {
+	if (resolvable) {
 		add_cause(ts, HT_RESOLVED_INHERITED, inherited);
 		add_cause(ts, HT_RESOLVED_WAIT_ONCPU,
 			  blocked_ns > inherited ? blocked_ns - inherited : 0);
@@ -541,6 +842,7 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
 	struct task_state *ts;
 	__u64 now = bpf_ktime_get_ns();
 	bool track_prev = in_target(prev), track_next = in_target(next);
+	bool irq_waker, woken, resolvable;
 	__u64 lo, hi, blocked_ns;
 	__u32 cause;
 
@@ -566,6 +868,22 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
 							sl->th.cause_ns[HT_ONCPU] +=
 								clip(ts->in_ts, now,
 								     fc->frame_start);
+						/* split off the on-CPU kernel stalls
+						 * taken since the last update */
+						carve(sl->th.cause_ns,
+						      HT_ONCPU_FAULT_MAJOR,
+						      ts->fault_major_ns -
+						      sl->snap_fault_major);
+						carve(sl->th.cause_ns, HT_ONCPU_FAULT,
+						      ts->fault_ns - sl->snap_fault);
+						carve(sl->th.cause_ns, HT_ONCPU_RECLAIM,
+						      ts->reclaim_ns - sl->snap_reclaim);
+						carve(sl->th.cause_ns, HT_ONCPU_COMPACT,
+						      ts->compact_ns - sl->snap_compact);
+						sl->snap_fault = ts->fault_ns;
+						sl->snap_fault_major = ts->fault_major_ns;
+						sl->snap_reclaim = ts->reclaim_ns;
+						sl->snap_compact = ts->compact_ns;
 						sl->out_ts = now;
 					}
 				}
@@ -601,19 +919,16 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
 
 	lo = ts->out_ts;
 	hi = now;
+	irq_waker = ts->links[0].flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE);
+	woken = ts->wake_ts != 0;
 	if (ts->out_state == TASK_RUNNING) {
 		cause = HT_RUNNABLE;
-	} else if (ts->wake_ts > lo && ts->wake_ts < now) {
-		hi = ts->wake_ts;
-		if (ts->links[0].flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE))
-			cause = ts->out_iowait ? HT_BLOCK_IO : HT_BLOCK_TIMER;
-		else
-			cause = ts->out_iowait ? HT_BLOCK_IO : HT_BLOCK_TASK;
-	} else if (ts->wake_ts) {
-		cause = ts->out_iowait ? HT_BLOCK_IO : HT_BLOCK_TASK;
 	} else {
-		cause = HT_BLOCK_OTHER;
+		if (ts->wake_ts > lo && ts->wake_ts < now)
+			hi = ts->wake_ts;	/* the rest is runqueue wait */
+		cause = blocked_cause(ts, irq_waker, woken);
 	}
+	resolvable = cause != HT_RUNNABLE && woken && !irq_waker;
 
 	/* hand this interval to whoever this task wakes next */
 	ts->last_out = lo;
@@ -661,7 +976,7 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
 		stat_inc(HT_STAT_STALLS);
 		if (cause != HT_RUNNABLE && blocked_ns)
 			resolve(ts, lo > ts->frame_start ? lo : ts->frame_start,
-				hi, cause, blocked_ns);
+				hi, cause, blocked_ns, resolvable);
 	}
 
 	ts->out_ts = 0;
@@ -699,6 +1014,11 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 			add_cause(ts, HT_ONCPU, clip(ts->in_ts, now, ts->frame_start));
 		else
 			ts->frame_flags |= HT_FRAME_NO_ROOT_STATE;
+		carve_oncpu(ts, HT_ONCPU_FAULT_MAJOR,
+			    ts->fault_major_ns - ts->snap_fault_major);
+		carve_oncpu(ts, HT_ONCPU_FAULT, ts->fault_ns - ts->snap_fault);
+		carve_oncpu(ts, HT_ONCPU_RECLAIM, ts->reclaim_ns - ts->snap_reclaim);
+		carve_oncpu(ts, HT_ONCPU_COMPACT, ts->compact_ns - ts->snap_compact);
 		frame_ns = now - ts->frame_start;
 		stat_inc(HT_STAT_FRAMES);
 
@@ -762,6 +1082,17 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 							sl->th.cause_ns[HT_ONCPU] +=
 								clip(ts->in_ts, now,
 								     ts->frame_start);
+						/* same split the record just got */
+						carve(sl->th.cause_ns,
+						      HT_ONCPU_FAULT_MAJOR,
+						      ts->fault_major_ns -
+						      sl->snap_fault_major);
+						carve(sl->th.cause_ns, HT_ONCPU_FAULT,
+						      ts->fault_ns - sl->snap_fault);
+						carve(sl->th.cause_ns, HT_ONCPU_RECLAIM,
+						      ts->reclaim_ns - sl->snap_reclaim);
+						carve(sl->th.cause_ns, HT_ONCPU_COMPACT,
+						      ts->compact_ns - sl->snap_compact);
 					}
 					if (nthreads < HT_MAX_THREADS) {
 						__builtin_memcpy(&rec->threads[nthreads],
@@ -796,6 +1127,10 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 	ts->is_root = true;
 	ts->frame_start = now;
 	ts->frame_id = frame_id;
+	ts->snap_fault = ts->fault_ns;
+	ts->snap_fault_major = ts->fault_major_ns;
+	ts->snap_reclaim = ts->reclaim_ns;
+	ts->snap_compact = ts->compact_ns;
 	ts->nstalls = 0;
 	ts->frame_flags = 0;
 	ts->in_ts = now;

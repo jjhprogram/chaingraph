@@ -17,11 +17,11 @@
  * through a different kernel mechanism:
  *
  *	sleep		root nanosleeps ~25 ms		-> HT_BLOCK_TIMER
- *	worker_block	worker blocks on a pipe the	-> HT_BLOCK_TASK,
+ *	worker_block	worker blocks on a pipe the	-> HT_BLOCK_FUTEX,
  *			feeder writes after ~20 ms	   inherited, chain
  *			   				   root <- worker
  *			   				   <- feeder <- timer
- *	worker_cpu	worker burns ~20 ms of CPU	-> HT_BLOCK_TASK,
+ *	worker_cpu	worker burns ~20 ms of CPU	-> HT_BLOCK_FUTEX,
  *			(negative control)		   HT_RESOLVED_WAIT_ONCPU
  *	cpu_spike	root burns ~25 ms of CPU	-> HT_ONCPU
  *			(negative control)
@@ -31,6 +31,12 @@
  *							   single stall dominating
  *	io		8 MB read after fadvise		-> HT_BLOCK_IO
  *			POSIX_FADV_DONTNEED (best effort)
+ *	poll		root waits in epoll_wait for	-> HT_BLOCK_POLL
+ *			the byte the feeder writes
+ *			after ~20 ms
+ *	fault		root touches a burst of fresh	-> HT_ONCPU_FAULT
+ *			anonymous pages: ~20 ms of
+ *			minor faults, on-CPU
  *
  * A frame is the interval between two marks, so the pace sleep that follows
  * mark N belongs to frame N+1: a healthy frame is mostly that timer sleep.
@@ -74,6 +80,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -99,6 +107,12 @@
 #define IO_BYTES		(8u << 20)
 #define IO_CHUNK		(256u << 10)
 #define IO_BLOCKED_MIN_NS	(2 * NSEC_PER_MSEC)	/* below this: no I/O */
+#define POLL_TIMEOUT_MS		250		/* bound on the epoll wait */
+#define FAULT_TARGET_NS		(20 * NSEC_PER_MSEC)	/* time spent faulting */
+#define FAULT_CAL_PAGES		4096		/* the calibration region */
+#define FAULT_CAL_RUNS		3
+#define FAULT_MIN_PAGES		512
+#define FAULT_MAX_BYTES		(256u << 20)	/* cap on the burst region */
 
 #define DEFAULT_DURATION_S	20
 #define DEFAULT_BUDGET_US	16667		/* 60 fps */
@@ -248,6 +262,8 @@ enum inject_class {
 	INJ_PREEMPT,
 	INJ_THOUSAND_CUTS,
 	INJ_IO,
+	INJ_POLL,
+	INJ_FAULT,
 	INJ_MAX,
 	INJ_NONE = INJ_MAX,	/* also the index of the "not injected" stats */
 };
@@ -263,12 +279,12 @@ static const struct inject_info {
 		"root nanosleeps ~25 ms",
 	},
 	[INJ_WORKER_BLOCK] = {
-		"worker_block", "HT_BLOCK_TASK", "HT_RESOLVED_INHERITED",
+		"worker_block", "HT_BLOCK_FUTEX", "HT_RESOLVED_INHERITED",
 		"worker blocks on a pipe the feeder writes after ~20 ms "
 		"(chain root <- worker <- feeder <- timer)",
 	},
 	[INJ_WORKER_CPU] = {
-		"worker_cpu", "HT_BLOCK_TASK", "HT_RESOLVED_WAIT_ONCPU",
+		"worker_cpu", "HT_BLOCK_FUTEX", "HT_RESOLVED_WAIT_ONCPU",
 		"negative control: worker burns ~20 ms of CPU, so the root "
 		"is waiting for work, not for the kernel",
 	},
@@ -289,6 +305,16 @@ static const struct inject_info {
 		"io", "HT_BLOCK_IO", NULL,
 		"root reads 8 MB after posix_fadvise(POSIX_FADV_DONTNEED) "
 		"(best effort: notes in the log when the read did not block)",
+	},
+	[INJ_POLL] = {
+		"poll", "HT_BLOCK_POLL", NULL,
+		"root waits in epoll_wait() for the byte the feeder writes "
+		"after ~20 ms (chain root <- feeder <- timer)",
+	},
+	[INJ_FAULT] = {
+		"fault", "HT_ONCPU_FAULT", NULL,
+		"root touches a burst of fresh anonymous pages: ~20 ms of "
+		"minor faults on-CPU, the page count calibrated at startup",
 	},
 };
 
@@ -319,6 +345,10 @@ static pid_t root_tid;
 static char scratch_path[PATH_MAX];
 static int io_fd = -1;
 static char *io_buf;
+static int poll_epfd = -1;
+static long fault_page_size;
+static size_t fault_pages;		/* 0 when the fault class is unusable */
+static double fault_ns_per_page;
 
 /* the root thread publishes its tid, then waits to be released */
 static pthread_mutex_t start_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -412,6 +442,21 @@ static void ask_feeder(void)
 	feeder.req++;
 	pthread_cond_signal(&feeder.req_cv);
 	pthread_mutex_unlock(&feeder.lock);
+}
+
+/*
+ * Take the feeder's byte off the pipe. The feeder writes exactly one byte per
+ * request, so this always completes once ask_feeder() has been called.
+ */
+static void feed_read_byte(void)
+{
+	for (;;) {
+		char byte;
+		ssize_t n = read(feed_pipe[0], &byte, 1);
+
+		if (n >= 0 || errno != EINTR)
+			break;
+	}
 }
 
 static void *feeder_thread(void *arg)
@@ -624,6 +669,115 @@ static void io_teardown(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* the epoll set behind the poll injector                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The root waits on the read end of the feeder's pipe. Level-triggered and
+ * only ever waited on inside the injector, so registering the fd for good
+ * does not disturb the worker, which reads the same pipe in worker_block.
+ */
+static int poll_setup(void)
+{
+	struct epoll_event ev;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.events = EPOLLIN;
+	ev.data.fd = feed_pipe[0];
+
+	poll_epfd = epoll_create1(EPOLL_CLOEXEC);
+	if (poll_epfd < 0) {
+		fprintf(stderr, "poll: epoll_create1: %s\n", strerror(errno));
+		return -1;
+	}
+	if (epoll_ctl(poll_epfd, EPOLL_CTL_ADD, feed_pipe[0], &ev)) {
+		fprintf(stderr, "poll: epoll_ctl: %s\n", strerror(errno));
+		close(poll_epfd);
+		poll_epfd = -1;
+		return -1;
+	}
+	return 0;
+}
+
+static void poll_teardown(void)
+{
+	if (poll_epfd >= 0) {
+		close(poll_epfd);
+		poll_epfd = -1;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* the page-fault burst                                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Map @pages of fresh anonymous memory, touch one byte in each and unmap it
+ * again. MAP_POPULATE is deliberately off, so every touch is a minor fault:
+ * the kernel allocates and zeroes the page inside handle_mm_fault() with the
+ * thread on-CPU. Returns how long the touch loop took, or -1 if the mapping
+ * failed (errno is then the mmap's).
+ */
+static long long touch_fresh_pages(size_t pages)
+{
+	size_t len = pages * (size_t)fault_page_size;
+	volatile char *p;
+	long long t0, dt;
+	size_t off;
+
+	p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+		 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+	if ((void *)p == MAP_FAILED)
+		return -1;
+	t0 = mono_now();
+	for (off = 0; off < len; off += (size_t)fault_page_size)
+		p[off] = 1;
+	dt = mono_now() - t0;
+	munmap((void *)p, len);
+	return dt;
+}
+
+/*
+ * Size the burst for this machine: touch a small region a few times, keep the
+ * fastest run (the least disturbed one, as calibrate_burn() does) and scale it
+ * up to FAULT_TARGET_NS. The region is capped, so a box where a fault is slow
+ * asks for a bounded amount of memory rather than an absurd one.
+ */
+static void calibrate_faults(void)
+{
+	double per_ns = 0;
+	size_t max_pages;
+	int i;
+
+	fault_page_size = sysconf(_SC_PAGESIZE);
+	if (fault_page_size <= 0)
+		fault_page_size = 4096;
+
+	for (i = 0; i < FAULT_CAL_RUNS; i++) {
+		long long dt = touch_fresh_pages(FAULT_CAL_PAGES);
+		double per;
+
+		if (dt < 0) {
+			fprintf(stderr, "fault: mmap of %d pages: %s\n",
+				FAULT_CAL_PAGES, strerror(errno));
+			return;
+		}
+		per = (double)dt / FAULT_CAL_PAGES;
+		if (per > 0 && (per_ns == 0 || per < per_ns))
+			per_ns = per;
+	}
+	/* a plausible fallback if the clock misbehaved: ~1 us per fault */
+	fault_ns_per_page = per_ns > 0 ? per_ns : 1000.0;
+
+	max_pages = FAULT_MAX_BYTES / (size_t)fault_page_size;
+	fault_pages = (size_t)((double)FAULT_TARGET_NS / fault_ns_per_page);
+	if (fault_pages < FAULT_MIN_PAGES)
+		fault_pages = FAULT_MIN_PAGES;
+	if (fault_pages > max_pages)
+		fault_pages = max_pages;
+}
+
+/* ------------------------------------------------------------------ */
 /* the injectors                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -689,6 +843,51 @@ static void inject(enum inject_class cls, char *note, size_t notelen)
 			snprintf(note, notelen,
 				 "io read did not block: %u bytes in %lld us",
 				 done, dt / NSEC_PER_USEC);
+		break;
+	}
+	case INJ_POLL: {
+		struct epoll_event ev;
+		long long t0, dt;
+		int n, err;
+
+		if (poll_epfd < 0) {
+			snprintf(note, notelen, "poll: no epoll instance");
+			break;
+		}
+		ask_feeder();
+		t0 = mono_now();
+		do {
+			n = epoll_wait(poll_epfd, &ev, 1, POLL_TIMEOUT_MS);
+		} while (n < 0 && errno == EINTR && !stop);
+		err = n < 0 ? errno : 0;
+		dt = mono_now() - t0;
+		/*
+		 * Take the byte whatever happened: the feeder writes one per
+		 * request, and leaving it on the pipe would short-circuit the
+		 * next frame that waits for it.
+		 */
+		feed_read_byte();
+		if (n != 1)
+			snprintf(note, notelen,
+				 "poll: epoll_wait returned %d (%s) after %lld us",
+				 n, err ? strerror(err) : "timeout",
+				 dt / NSEC_PER_USEC);
+		break;
+	}
+	case INJ_FAULT: {
+		long long dt;
+
+		if (!fault_pages) {
+			snprintf(note, notelen, "fault: region unavailable");
+			break;
+		}
+		dt = touch_fresh_pages(fault_pages);
+		if (dt < 0)
+			snprintf(note, notelen, "fault: mmap of %zu pages: %s",
+				 fault_pages, strerror(errno));
+		else
+			snprintf(note, notelen, "%zu pages touched in %lld us",
+				 fault_pages, dt / NSEC_PER_USEC);
 		break;
 	}
 	case INJ_WORKER_BLOCK:
@@ -1066,6 +1265,15 @@ int main(int argc, char **argv)
 			io_teardown();
 		}
 	}
+	if (env.interval > 0 && (env.only == INJ_NONE || env.only == INJ_POLL)) {
+		if (poll_setup())
+			fprintf(stderr, "poll class degraded: no epoll set\n");
+	}
+	if (env.interval > 0 && (env.only == INJ_NONE || env.only == INJ_FAULT)) {
+		calibrate_faults();
+		if (!fault_pages)
+			fprintf(stderr, "fault class degraded: no region\n");
+	}
 
 	pin_cpu = pick_pin_cpu();
 	calibrate_burn();
@@ -1110,6 +1318,11 @@ int main(int argc, char **argv)
 	printf("busy loop %.1f Miter/s, pin_cpu=%d hogs=%d scratch=%s\n",
 	       burn_iters_per_ns * 1000.0, pin_cpu, NHOGS,
 	       io_fd >= 0 ? scratch_path : "(none)");
+	if (fault_pages)
+		printf("fault burst %zu pages (%.0f MB) at %.0f ns/page\n",
+		       fault_pages,
+		       (double)fault_pages * (double)fault_page_size / (1 << 20),
+		       fault_ns_per_page);
 	if (env.interval <= 0) {
 		printf("schedule: no injection (-i 0)\n");
 	} else if (env.only != INJ_NONE) {
@@ -1153,6 +1366,7 @@ out:
 	if (have_feeder)
 		pthread_join(feeder_tid, NULL);
 
+	poll_teardown();
 	if (feed_pipe[0] >= 0)
 		close(feed_pipe[0]);
 	if (feed_pipe[1] >= 0)

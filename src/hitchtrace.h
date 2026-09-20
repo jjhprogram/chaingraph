@@ -32,17 +32,35 @@
  * and is reported separately (it does not add to the partition).
  */
 enum ht_cause {
-	HT_ONCPU,		/* running */
+	HT_ONCPU,		/* running, outside any kernel stall below */
+	HT_ONCPU_FAULT,		/* on-CPU inside a minor page fault */
+	HT_ONCPU_FAULT_MAJOR,	/* on-CPU inside a major page fault */
+	HT_ONCPU_RECLAIM,	/* on-CPU inside direct/memcg reclaim */
+	HT_ONCPU_COMPACT,	/* on-CPU inside compaction */
 	HT_RUNNABLE,		/* preempted: runnable, not running */
 	HT_RUNQUEUE,		/* woken, waiting for a CPU */
-	HT_BLOCK_TASK,		/* blocked, woken by another task */
+	HT_BLOCK_FUTEX,		/* blocked in a futex wait (incl. futex_waitv) */
+	HT_BLOCK_POLL,		/* blocked in poll/epoll/select */
 	HT_BLOCK_IO,		/* blocked with in_iowait set */
-	HT_BLOCK_TIMER,		/* blocked, woken from interrupt context */
-	HT_BLOCK_OTHER,		/* blocked, no wakeup seen */
+	HT_BLOCK_TIMER,		/* blocked in a sleep, or woken by an interrupt */
+	HT_BLOCK_GPU,		/* blocked waiting on a GPU fence */
+	HT_BLOCK_PRESENT,	/* blocked inside present/acquire */
+	HT_BLOCK_TASK,		/* blocked, woken by another task */
+	HT_BLOCK_OTHER,		/* blocked, nothing above applied */
 	HT_CAUSE_PARTITION,	/* ---- above sums to frame_ns ---- */
 	HT_RESOLVED_WAIT_ONCPU = HT_CAUSE_PARTITION,	/* waker was running */
 	HT_RESOLVED_INHERITED,	/* waker was itself stalled */
 	HT_CAUSE_MAX,
+};
+
+/* Syscall classes a thread can be blocked inside, from sys_enter/sys_exit. */
+enum ht_sysclass {
+	HT_SC_NONE,
+	HT_SC_FUTEX,
+	HT_SC_POLL,
+	HT_SC_SLEEP,
+	HT_SC_IO,
+	HT_SC_MAX,
 };
 
 /* hop.flags / hitch_record.flags */

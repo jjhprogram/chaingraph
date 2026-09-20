@@ -18,9 +18,9 @@ struct ht_record (src/hitchtrace.h).
   {"frame_id": 412, "root_pid": 4242, "root_tgid": 4200, "root_comm": "hb_root",
    "frame_start_ns": 5099456789, "frame_end_ns": 5123456789,
    "frame_ns": 24000000, "budget_ns": 16667000, "nstalls": 3, "flags": [],
-   "cause_ns": {"oncpu": 4000000, "runnable": 0, "runqueue": 0,
-                "block_task": 20000000, "block_io": 0, "block_timer": 0,
-                "block_other": 0,
+   "cause_ns": {"oncpu": 4000000, "oncpu_fault": 0, "oncpu_reclaim": 0,
+                "runnable": 0, "runqueue": 0, "block_futex": 0, "block_io": 0,
+                "block_task": 20000000, "block_other": 0, ...,
                 "resolved_wait_oncpu": 2000000, "resolved_inherited": 18000000},
    "worst": {"ns": 19000000, "start_ns": 5103456789, "cause": "block_task",
              "kstack_id": 7, "ustack_id": -1,
@@ -53,10 +53,15 @@ Both writers add fields this checker does not look at (hitchbench's
 "expect_resolved" and "note", hitchtrace's stacks and "blocked_in"); they are
 ignored, as is any object without a "frame_id" (a header or a stats line).
 
+A bucket is one entry of enum ht_cause, and its JSON key is the enum name
+lowercased without the HT_ prefix ("HT_BLOCK_FUTEX" -> "block_futex"). How
+many there are is read off that list and never assumed anywhere.
+
 Spellings that are accepted anywhere a bucket is named: with or without the
 HT_ prefix, any case ("HT_BLOCK_TASK", "block_task"), plus "inherited" and
 "wait_oncpu" for the two HT_RESOLVED_* buckets. "cause_ns" may also be a
-JSON array in enum order (7 or HT_CAUSE_MAX entries), "flags" may be the
+JSON array in enum order (HT_CAUSE_PARTITION or HT_CAUSE_MAX entries; a
+thread's own array stops at the partition), "flags" may be the
 HT_HOP_*/HT_FRAME_*/HT_THREAD_* bitmask instead of a list of names, and a
 "cause" of "unknown" reads as no cause at all. A thread's "largest" and
 "preemptor" are also read from flat largest_*/preemptor_* keys.
@@ -73,8 +78,8 @@ Subcommands (exit status 0 = pass, 1 = check failed, 2 = usage/IO error):
          [--chain comm1,comm2,...] [--min-frac F] [--min-frames N]
       Fail unless at least N frames injected with class C have a record
       whose largest partition bucket is B, carrying at least F of the
-      frame's excess (frame_ns - budget_ns), whose HT_BLOCK_TASK time is
-      dominated by the HT_RESOLVED_<R> bucket if --resolved is given, and
+      frame's excess (frame_ns - budget_ns), whose blocked time is dominated
+      by the HT_RESOLVED_<R> bucket if --resolved is given, and
       whose worst stall's hops match --chain in order (substring per hop,
       "*" matches any hop; an interrupt hop also answers to "[hardirq]",
       "[softirq]", "[irqexit]", an idle waker to "[idle]").
@@ -96,13 +101,21 @@ Subcommands (exit status 0 = pass, 1 = check failed, 2 = usage/IO error):
       reports how many uninjected frames the ground truth itself puts over
       budget, which is the noise floor the gate cannot be blamed for.
 
-  invariant HITCH.jsonl [--tol-us T]
+  invariant HITCH.jsonl [--tol-us T] [--oncpu-stall]
       Fail if a record's partition buckets (HT_ONCPU..HT_BLOCK_OTHER) do not
       sum to frame_ns within T, or if HT_RESOLVED_WAIT_ONCPU +
-      HT_RESOLVED_INHERITED exceeds HT_BLOCK_TASK by more than T. Where a
-      record carries per-thread detail, also fail unless exactly one of its
-      threads is the root and that root's buckets agree, within T, with the
-      record's own: the two are the same timeline seen twice.
+      HT_RESOLVED_INHERITED exceeds the frame's blocked time (every
+      HT_BLOCK_* bucket together: the pair splits any wait a task ended) by
+      more than T. Where a record carries per-thread detail, also fail
+      unless exactly one of its threads is the root and that root's buckets
+      agree, within T, with the record's own: the two are the same timeline
+      seen twice. With --oncpu-stall, also weigh the buckets carved out of
+      HT_ONCPU at frame close (HT_ONCPU_FAULT, HT_ONCPU_FAULT_MAJOR,
+      HT_ONCPU_RECLAIM, HT_ONCPU_COMPACT) against the frame they came from:
+      together they cannot outlast it, and what the carve-out left in
+      HT_ONCPU cannot either -- the counter is unsigned, so going below zero
+      shows up as a bucket far larger than the frame rather than a negative
+      one.
 
 Any FILE may be "-" for stdin.
 """
@@ -114,17 +127,30 @@ import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-# enum ht_cause, in order. The first PARTITION entries sum to frame_ns; the
-# two HT_RESOLVED_* buckets split HT_BLOCK_TASK and are reported separately.
-BUCKETS = ("oncpu", "runnable", "runqueue", "block_task", "block_io",
-           "block_timer", "block_other",
+# enum ht_cause, in order, as src/hitchtrace.h spells it. The entries before
+# HT_CAUSE_PARTITION (the first resolution bucket) sum to frame_ns; the two
+# HT_RESOLVED_* buckets split the frame's blocked time by what the waker was
+# doing and are reported separately. This tuple is the only place the set of
+# buckets is written down: the partition boundary and every group below are
+# derived from it, so adding a cause here is all it takes.
+BUCKETS = ("oncpu", "oncpu_fault", "oncpu_fault_major", "oncpu_reclaim",
+           "oncpu_compact", "runnable", "runqueue",
+           "block_futex", "block_poll", "block_io", "block_timer",
+           "block_gpu", "block_present", "block_task", "block_other",
            "resolved_wait_oncpu", "resolved_inherited")
-PARTITION = 7
+PARTITION = BUCKETS.index("resolved_wait_oncpu")	# HT_CAUSE_PARTITION
 IDX = {name: i for i, name in enumerate(BUCKETS)}
 ONCPU = IDX["oncpu"]
-BLOCK_TASK = IDX["block_task"]
 WAIT_ONCPU = IDX["resolved_wait_oncpu"]
 INHERITED = IDX["resolved_inherited"]
+# Time the thread held a CPU: HT_ONCPU plus the kernel stalls carved out of
+# it at frame close. ONCPU_STALLS is just the carve-outs (--oncpu-stall).
+ONCPU_BUCKETS = tuple(i for i in range(PARTITION)
+                      if BUCKETS[i].startswith("oncpu"))
+ONCPU_STALLS = tuple(i for i in ONCPU_BUCKETS if i != ONCPU)
+# Time the thread was blocked: what the HT_RESOLVED_* pair splits. Runnable
+# and runqueue time is off-CPU too, but nobody woke the thread out of it.
+BLOCKED = tuple(i for i in range(PARTITION) if BUCKETS[i].startswith("block_"))
 
 BUCKET_ALIASES = {
     "wait_oncpu": "resolved_wait_oncpu",
@@ -132,6 +158,8 @@ BUCKET_ALIASES = {
     "inherited": "resolved_inherited",
     "resolved_waker_oncpu": "resolved_wait_oncpu",
     "cause_partition": "resolved_wait_oncpu",	# HT_CAUSE_PARTITION aliases it
+    "oncpu_minor_fault": "oncpu_fault",
+    "oncpu_major_fault": "oncpu_fault_major",
 }
 
 # HT_HOP_* bits, and the label an interrupt hop answers to in --chain.
@@ -196,6 +224,11 @@ def optional_bucket(value) -> Optional[str]:
 
 def enum_name(bucket: str) -> str:
     return "HT_" + bucket.upper()
+
+
+def blocked_ns(cause_ns: Sequence[int]) -> int:
+    """Everything one timeline spent blocked, across the HT_BLOCK_* buckets."""
+    return sum(cause_ns[i] for i in BLOCKED)
 
 
 def normalize_flags(value, bits) -> Set[str]:
@@ -340,8 +373,13 @@ class Thread:
         return BUCKETS[best]
 
     def offcpu_ns(self) -> int:
-        """Everything but HT_ONCPU: what --min-frac is measured against."""
-        return sum(self.cause_ns[i] for i in range(PARTITION) if i != ONCPU)
+        """Everything outside the on-CPU buckets: what --min-frac measures.
+
+        A page fault or a reclaim is time the thread held a CPU, so it counts
+        with HT_ONCPU and not against the stall the thread is being judged on.
+        """
+        return sum(self.cause_ns[i] for i in range(PARTITION)
+                   if i not in ONCPU_BUCKETS)
 
     def label(self) -> str:
         who = self.comm or "?"
@@ -796,13 +834,14 @@ def match_chain(hops: Sequence[Hop], patterns: Sequence[str]) -> Optional[str]:
 
 def check_frame(rec: Optional[Record], bucket: str, min_frac: float,
                 resolved: Optional[str],
-                chain: Sequence[str]) -> List[Tuple[str, str]]:
+                chain: Sequence[str],
+                need_largest: bool = True) -> List[Tuple[str, str]]:
     """(kind, detail) for each way this injected frame is not diagnosed."""
     if rec is None:
         return [("no record", "no record for this frame")]
     reasons = []
     largest = rec.largest()
-    if largest != bucket:
+    if need_largest and largest != bucket:
         reasons.append(("wrong bucket",
                         "largest bucket is %s (%s), expected %s"
                         % (enum_name(largest), _ns(rec.bucket(largest)),
@@ -816,16 +855,20 @@ def check_frame(rec: Optional[Record], bucket: str, min_frac: float,
                         % (enum_name(bucket), _ns(got), _ns(int(need)),
                            min_frac, _ns(excess))))
     if resolved is not None:
-        block = rec.bucket("block_task")
+        # Any wait a task ended is resolved through its waker, whichever
+        # HT_BLOCK_* bucket the wait itself landed in, so the resolution is
+        # weighed against everything the frame spent blocked.
+        block = blocked_ns(rec.cause_ns)
         mine = rec.bucket(resolved)
         other = rec.cause_ns[WAIT_ONCPU if resolved == BUCKETS[INHERITED]
                              else INHERITED]
         if block <= 0:
             reasons.append(("wrong resolution",
-                            "HT_BLOCK_TASK is zero, nothing to resolve"))
+                            "the frame blocked nowhere, nothing to resolve"))
         elif mine < RESOLVED_MIN_FRAC * block or mine < other:
             reasons.append(("wrong resolution",
-                            "%s is %s of %s HT_BLOCK_TASK (other resolution %s)"
+                            "%s is %s of the %s the frame spent blocked "
+                            "(other resolution %s)"
                             % (enum_name(resolved), _ns(mine), _ns(block),
                                _ns(other))))
     if chain:
@@ -988,17 +1031,21 @@ def cmd_join(frames: Sequence[Frame], records: Sequence[Record],
 def cmd_expect(frames: Sequence[Frame], records: Sequence[Record],
                cls: str, bucket: str, min_frac: float, min_frames: int,
                resolved: Optional[str],
-               chain: Sequence[str]) -> Tuple[bool, List[str]]:
+               chain: Sequence[str],
+               need_largest: bool = True) -> Tuple[bool, List[str]]:
     by_id, _ = index_records(records)
     sel = [f for f in frames if f.injected == cls]
     good, bad = [], []
     for f in sel:
         rec = by_id.get(f.frame_id)
-        reasons = check_frame(rec, bucket, min_frac, resolved, chain)
+        reasons = check_frame(rec, bucket, min_frac, resolved, chain,
+                              need_largest)
         (good if not reasons else bad).append((f, rec, reasons))
 
-    want = "%s as the largest bucket with >= %.2f of the excess" % (
-        enum_name(bucket), min_frac)
+    want = "%s %s>= %.2f of the excess" % (
+        enum_name(bucket),
+        "as the largest bucket with " if need_largest else "carrying ",
+        min_frac)
     if resolved is not None:
         want += ", resolved %s" % enum_name(resolved)
     if chain:
@@ -1179,7 +1226,33 @@ def thread_problems(rec: Record, tol_ns: int) -> List[str]:
     return problems
 
 
-def cmd_invariant(records: Sequence[Record], tol_ns: int) -> Tuple[bool, List[str]]:
+def oncpu_stall_problems(who: str, cause_ns: Sequence[int], frame_ns: int,
+                         tol_ns: int) -> List[str]:
+    """--oncpu-stall: the carve-outs weighed against the frame they came from.
+
+    Page faults, reclaim and compaction are carved out of HT_ONCPU when the
+    frame closes, so together they cannot outlast the frame, and what is left
+    in HT_ONCPU cannot have gone below zero. The counters are unsigned, so an
+    underflow arrives as a bucket far larger than the frame, not a negative
+    one.
+    """
+    problems = []
+    stalls = sum(cause_ns[i] for i in ONCPU_STALLS)
+    if stalls - frame_ns > tol_ns:
+        part = "  ".join("%s %s" % (BUCKETS[i], _ns(cause_ns[i]))
+                         for i in ONCPU_STALLS if cause_ns[i])
+        problems.append("%sthe on-CPU stalls sum to %s, more than the %s "
+                        "frame (%s)"
+                        % (who, _ns(stalls), _ns(frame_ns), part))
+    if cause_ns[ONCPU] - frame_ns > tol_ns:
+        problems.append("%sHT_ONCPU is %s, more than the %s frame: the "
+                        "carve-out took it below zero"
+                        % (who, _ns(cause_ns[ONCPU]), _ns(frame_ns)))
+    return problems
+
+
+def cmd_invariant(records: Sequence[Record], tol_ns: int,
+                  oncpu_stall: bool = False) -> Tuple[bool, List[str]]:
     bad: List[Tuple[Record, List[str]]] = []
     for rec in records:
         problems = []
@@ -1190,12 +1263,19 @@ def cmd_invariant(records: Sequence[Record], tol_ns: int) -> Tuple[bool, List[st
                             % (_ns(total), _ns(rec.frame_ns),
                                _ns(abs(total - rec.frame_ns)), _ns(tol_ns)))
         resolved = rec.cause_ns[WAIT_ONCPU] + rec.cause_ns[INHERITED]
-        block = rec.cause_ns[BLOCK_TASK]
+        block = blocked_ns(rec.cause_ns)
         if resolved - block > tol_ns:
             problems.append("resolved %s (wait_oncpu %s + inherited %s) exceeds "
-                            "HT_BLOCK_TASK %s"
+                            "the %s the frame spent blocked"
                             % (_ns(resolved), _ns(rec.cause_ns[WAIT_ONCPU]),
                                _ns(rec.cause_ns[INHERITED]), _ns(block)))
+        if oncpu_stall:
+            problems += oncpu_stall_problems("", rec.cause_ns, rec.frame_ns,
+                                             tol_ns)
+            for th in rec.threads:
+                problems += oncpu_stall_problems("%s: " % th.label(),
+                                                 th.cause_ns, rec.frame_ns,
+                                                 tol_ns)
         problems += thread_problems(rec, tol_ns)
         if problems:
             bad.append((rec, problems))
@@ -1205,8 +1285,10 @@ def cmd_invariant(records: Sequence[Record], tol_ns: int) -> Tuple[bool, List[st
         if not records:
             return True, ["ok: no records to check"]
         return True, ["ok: %d record(s) partition frame_ns within %s "
-                      "(%d with per-thread detail)"
-                      % (len(records), _ns(tol_ns), with_threads)]
+                      "(%d with per-thread detail%s)"
+                      % (len(records), _ns(tol_ns), with_threads,
+                         "; on-CPU stalls fit the frame"
+                         if oncpu_stall else "")]
     report = ["FAILED invariant: %d of %d record(s) do not add up"
               % (len(bad), len(records))]
     for rec, problems in bad[:DIAG_TOP]:
@@ -1241,7 +1323,8 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--bucket", required=True,
                    help="expected largest partition bucket, e.g. HT_BLOCK_TASK")
     e.add_argument("--resolved", choices=("inherited", "wait_oncpu"),
-                   help="HT_BLOCK_TASK must be dominated by this resolution")
+                   help="the frame's blocked time must be dominated by this "
+                        "resolution")
     e.add_argument("--chain", default="",
                    help="comma-separated hop comms, direct waker first; "
                         "substring per hop, '*' matches any hop")
@@ -1250,6 +1333,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default 0.5)")
     e.add_argument("--min-frames", type=int, default=1,
                    help="how many injected frames must pass (default 1)")
+    e.add_argument("--any-size", action="store_true",
+                   help="the bucket need not be the largest, only carry "
+                        "--min-frac of the excess (for a cause that shares a "
+                        "frame with unavoidable work, e.g. page faults)")
 
     t = sub.add_parser("threads",
                        help="assert the per-thread detail of a class")
@@ -1293,6 +1380,10 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("records")
     i.add_argument("--tol-us", type=int, default=500,
                    help="tolerance in microseconds (default 500)")
+    i.add_argument("--oncpu-stall", dest="oncpu_stall", action="store_true",
+                   help="also assert the buckets carved out of HT_ONCPU "
+                        "(faults, reclaim, compaction) fit inside the frame "
+                        "and left HT_ONCPU itself no larger than it")
     return p
 
 
@@ -1321,7 +1412,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         else normalize_bucket(args.resolved))
             ok, report = cmd_expect(frames, records, args.cls, bucket,
                                     args.min_frac, args.min_frames, resolved,
-                                    split_chain(args.chain))
+                                    split_chain(args.chain),
+                                    need_largest=not args.any_size)
         elif args.cmd == "threads":
             names = ([args.bucket] if args.bucket
                      else split_chain(args.bucket_any))
@@ -1350,7 +1442,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             budget = None if args.budget_us is None else args.budget_us * 1000
             ok, report = cmd_quiet(frames, records, args.max_false, budget)
         else:
-            ok, report = cmd_invariant(records, args.tol_us * 1000)
+            ok, report = cmd_invariant(records, args.tol_us * 1000,
+                                       args.oncpu_stall)
     except ParseError as e:
         print("check_hitches: %s" % e, file=sys.stderr)
         return 2
