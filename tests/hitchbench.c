@@ -7,14 +7,22 @@
  *	   |  \
  *	   |   +-- hb_hogN (pinned busy threads, woken by the preempt injector)
  *	   |
- *	   +-- hitch_frame_mark(frame_id)	<- the uprobe target
+ *	   +-- hitch_frame_mark(frame_id)	<- uprobe target: present entry
+ *	   +-- hitch_present_end(frame_id)	<- uprobe target: present return
  *
  * hb_root runs a paced frame loop. Every frame it burns a fixed slice of CPU
  * (a calibrated, work-bounded busy loop, so preemption stretches it in wall
- * time), hands a small job to hb_worker and waits for it, calls the frame
- * marker exactly once, and then sleeps to pace the loop. On the frames picked
- * by the schedule it also runs one injector, each of which stalls the frame
- * through a different kernel mechanism:
+ * time), hands a small job to hb_worker and waits for it, and then presents:
+ * hitch_frame_mark(frame_id) is the present call going in, the loop sleeps to
+ * the frame's deadline while it is inside, and hitch_present_end(frame_id) is
+ * the same call coming back. The pace sleep sitting between the two markers is
+ * deliberate: it models a FIFO present, where what paces the app is the display
+ * refusing to take another image before the next vblank. So an ordinary frame's
+ * pacing time is present time, and hitchtrace should put it in block_present
+ * rather than naming it after the timer the sleep happens to use.
+ *
+ * On the frames picked by the schedule the loop also runs one injector, each of
+ * which stalls the frame through a different kernel mechanism:
  *
  *	sleep		root nanosleeps ~25 ms		-> HT_BLOCK_TIMER
  *	worker_block	worker blocks on a pipe the	-> HT_BLOCK_FUTEX,
@@ -37,9 +45,13 @@
  *	fault		root touches a burst of fresh	-> HT_ONCPU_FAULT
  *			anonymous pages: ~20 ms of
  *			minor faults, on-CPU
+ *	present_long	the present itself waits ~20 ms	-> HT_BLOCK_PRESENT
+ *			longer than the pace, the rest
+ *			of the frame normal
  *
- * A frame is the interval between two marks, so the pace sleep that follows
- * mark N belongs to frame N+1: a healthy frame is mostly that timer sleep.
+ * A frame is the interval between two marks, so the present that follows mark
+ * N -- the pace sleep and the hitch_present_end() after it -- belongs to frame
+ * N+1: a healthy frame is mostly that present wait.
  * The loop paces to 1/8 under the budget (14.6 ms, ~69 fps at the defaults)
  * rather than to the budget itself: with marks on an absolute grid a healthy
  * frame is exactly one period long, so pacing at the budget would put half
@@ -60,8 +72,11 @@
  * them is not the bucket but how the wait resolves through the waker. t_end_ns
  * is CLOCK_MONOTONIC (the clock behind bpf_ktime_get_ns()) read immediately
  * before the marker call, so frame_us is mark-to-mark, measured the same way
- * at both ends. The line is written just after the mark, so its write(2)
- * lands at the very start of the next frame.
+ * at both ends. The line is written just after the mark, so its write(2) lands
+ * at the very start of the next frame -- and therefore inside that frame's
+ * present bracket, since the mark is present entry. It is a buffered append to
+ * a local file and does not block in practice; if it ever did, the harness's
+ * own bookkeeping would be counted as present time rather than as I/O.
  *
  * usage: hitchbench [-d SECONDS] [-b BUDGET_US] [-s SEED] [-o FILE]
  *                   [-c CLASS] [-i INTERVAL_FRAMES] [-l] [-h]
@@ -99,6 +114,7 @@
 #define INJECT_CPU_NS		(25 * NSEC_PER_MSEC)
 #define INJECT_FEED_NS		(20 * NSEC_PER_MSEC)
 #define INJECT_WORKER_CPU_NS	(20 * NSEC_PER_MSEC)
+#define INJECT_PRESENT_NS	(20 * NSEC_PER_MSEC)	/* on top of the pace */
 #define PREEMPT_WINDOW_NS	(20 * NSEC_PER_MSEC)	/* hogs run this long */
 #define PREEMPT_WORK_NS		(5 * NSEC_PER_MSEC)	/* root's work meanwhile */
 #define NHOGS			3
@@ -126,16 +142,23 @@
 /* ------------------------------------------------------------------ */
 
 static volatile unsigned long hitch_frame_seen;
+static volatile unsigned long hitch_present_seen;
 
 /*
  * void hitch_frame_mark(unsigned long frame_id)
+ * void hitch_present_end(unsigned long frame_id)
  *
- * Deliberately dull and deliberately unoptimizable: external linkage so the
- * name is in .symtab, noinline/noclone so no caller gets a specialized copy,
- * used so it survives even if nothing calls it, and an asm barrier plus a
- * store to a volatile so GCC cannot infer it is pure and drop the calls.
- * At the uprobe (function entry) the frame id is simply the first argument
- * in the ABI's first argument register.
+ * The two halves of the present bracket, and deliberately dull and deliberately
+ * unoptimizable: external linkage so the names are in .symtab, noinline/noclone
+ * so no caller gets a specialized copy, used so they survive even if nothing
+ * calls them, and an asm barrier plus a store to a volatile so GCC cannot infer
+ * they are pure and drop the calls. At the uprobe (function entry) the frame id
+ * is simply the first argument in the ABI's first argument register.
+ *
+ * hitch_frame_mark() is the frame boundary as well as present entry: the frame
+ * it names ends there and the next one begins. hitch_present_end() carries the
+ * id of the frame it presented, so the two calls of one present agree, and the
+ * wait between them is charged to the frame that just opened.
  */
 #if defined(__GNUC__) && !defined(__clang__)
 #define HB_MARKER __attribute__((noinline, noclone, used))
@@ -147,6 +170,12 @@ HB_MARKER void hitch_frame_mark(unsigned long frame_id)
 {
 	__asm__ __volatile__("" : : "r"(frame_id) : "memory");
 	hitch_frame_seen = frame_id;
+}
+
+HB_MARKER void hitch_present_end(unsigned long frame_id)
+{
+	__asm__ __volatile__("" : : "r"(frame_id) : "memory");
+	hitch_present_seen = frame_id;
 }
 
 /* ------------------------------------------------------------------ */
@@ -264,6 +293,7 @@ enum inject_class {
 	INJ_IO,
 	INJ_POLL,
 	INJ_FAULT,
+	INJ_PRESENT_LONG,
 	INJ_MAX,
 	INJ_NONE = INJ_MAX,	/* also the index of the "not injected" stats */
 };
@@ -315,6 +345,12 @@ static const struct inject_info {
 		"fault", "HT_ONCPU_FAULT", NULL,
 		"root touches a burst of fresh anonymous pages: ~20 ms of "
 		"minor faults on-CPU, the page count calibrated at startup",
+	},
+	[INJ_PRESENT_LONG] = {
+		"present_long", "HT_BLOCK_PRESENT", NULL,
+		"the present itself waits ~20 ms past the pace, as if the "
+		"swapchain made the app sit out an extra vblank or two; the "
+		"rest of the frame is a normal one",
 	},
 };
 
@@ -782,9 +818,11 @@ static void calibrate_faults(void)
 /* ------------------------------------------------------------------ */
 
 /*
- * Everything a class does on the root thread. The two worker classes do their
- * work through the job handed to the worker below, so they do nothing here.
- * @note is filled in only when something worth reporting happened.
+ * Everything a class does inside the root's own frame work. The two worker
+ * classes do their work through the job handed to the worker below, and
+ * present_long does its waiting inside the present bracket, so all three do
+ * nothing here. @note is filled in only when something worth reporting
+ * happened.
  */
 static void inject(enum inject_class cls, char *note, size_t notelen)
 {
@@ -892,9 +930,27 @@ static void inject(enum inject_class cls, char *note, size_t notelen)
 	}
 	case INJ_WORKER_BLOCK:
 	case INJ_WORKER_CPU:
+	case INJ_PRESENT_LONG:
 	case INJ_MAX:
 		break;
 	}
+}
+
+/*
+ * What a class adds to the present itself, called between hitch_frame_mark()
+ * and hitch_present_end() and so inside the bracket: for present_long, the
+ * swapchain holding the app past the vblank it paced to.
+ */
+static void inject_present(enum inject_class cls, char *note, size_t notelen)
+{
+	long long t0;
+
+	if (cls != INJ_PRESENT_LONG)
+		return;
+	t0 = mono_now();
+	sleep_ns(INJECT_PRESENT_NS);
+	snprintf(note, notelen, "present held on for an extra %lld us",
+		 (mono_now() - t0) / NSEC_PER_USEC);
 }
 
 static enum job_kind job_for(enum inject_class cls)
@@ -1006,11 +1062,18 @@ static void *root_thread(void *arg)
 	pthread_mutex_unlock(&start_lock);
 
 	end_ns = mono_now() + (long long)env.duration_s * NSEC_PER_SEC;
-	next_pace_ns = mono_now();
 
 	/* frame 0 only opens the first frame; it is never logged */
 	prev_mark_ns = mono_now();
 	hitch_frame_mark(frame_id);
+
+	/*
+	 * The pacing grid is anchored on that mark and advances one period per
+	 * frame. It starts a period behind, so frame 1's deadline is the mark
+	 * itself: the first present returns at once and the grid restarts from
+	 * there, leaving the short unpaced first frame the loop has always had.
+	 */
+	next_pace_ns = prev_mark_ns - period_ns;
 
 	while (!stop && mono_now() < end_ns) {
 		enum inject_class cls = INJ_NONE;
@@ -1021,6 +1084,23 @@ static void *root_thread(void *arg)
 		if (env.interval > 0 && frame_id % (unsigned long)env.interval == 0)
 			cls = next_class();
 
+		/*
+		 * Still inside the present the previous iteration's mark went
+		 * into: the pace sleep to this frame's deadline happens here,
+		 * so it is the display holding the app back and not a timer the
+		 * app chose to wait on.
+		 */
+		now = mono_now();
+		next_pace_ns += period_ns;
+		if (next_pace_ns <= now)
+			next_pace_ns = now;	/* overran: no sleep, regrid */
+		else
+			sleep_until(next_pace_ns);
+		inject_present(cls, note, sizeof(note));
+		/* the present returns, naming the frame it presented */
+		hitch_present_end(frame_id - 1);
+
+		/* and only now does this frame's own work start */
 		burn_ns(FRAME_CPU_NS);
 		inject(cls, note, sizeof(note));
 		run_job(job_for(cls));
@@ -1031,14 +1111,9 @@ static void *root_thread(void *arg)
 		log_frame(frame_id, cls, t_end_ns - prev_mark_ns, t_end_ns,
 			  note);
 		prev_mark_ns = t_end_ns;
-
-		now = mono_now();
-		next_pace_ns += period_ns;
-		if (next_pace_ns <= now)
-			next_pace_ns = now;	/* overran: no sleep, regrid */
-		else
-			sleep_until(next_pace_ns);
 	}
+	/* nothing else would close the present the last mark went into */
+	hitch_present_end(frame_id);
 	return NULL;
 }
 
@@ -1119,7 +1194,10 @@ static void usage(FILE *f, const char *prog)
 "       [-c CLASS] [-i INTERVAL_FRAMES] [-l] [-h]\n"
 "\n"
 "A synthetic frame loop that hitches on purpose, for testing hitchtrace.\n"
-"Attach a uprobe to hitch_frame_mark(); its only argument is the frame id.\n"
+"Attach uprobes to hitch_frame_mark() (the frame boundary, and the present\n"
+"call going in) and to hitch_present_end() (the same call coming back); the\n"
+"only argument of each is the frame id. The pace sleep runs between the two,\n"
+"as a FIFO present does, so a healthy frame's pacing is present time.\n"
 "\n"
 "  -d SECONDS   run this long (default %d)\n"
 "  -b BUDGET_US frame budget; the loop paces to 1/8 under it (default %d)\n"
@@ -1137,10 +1215,10 @@ static void list_classes(void)
 {
 	int i;
 
-	printf("%-14s %-15s %-22s %s\n",
+	printf("%-14s %-16s %-22s %s\n",
 	       "CLASS", "EXPECT", "EXPECT_RESOLVED", "WHAT IT DOES");
 	for (i = 0; i < INJ_MAX; i++)
-		printf("%-14s %-15s %-22s %s\n", classes[i].name,
+		printf("%-14s %-16s %-22s %s\n", classes[i].name,
 		       classes[i].expect,
 		       classes[i].expect_resolved ? classes[i].expect_resolved : "-",
 		       classes[i].desc);
@@ -1309,7 +1387,7 @@ int main(int argc, char **argv)
 	n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
 	exe[n > 0 ? n : 0] = '\0';
 
-	printf("hitchbench pid=%d root_tid=%d binary=%s marker=hitch_frame_mark budget_us=%ld\n",
+	printf("hitchbench pid=%d root_tid=%d binary=%s marker=hitch_frame_mark budget_us=%ld present_marker=hitch_present_end\n",
 	       (int)getpid(), (int)root_tid, exe, env.budget_us);
 	printf("period_us=%lld (%.1f fps) duration_s=%ld seed=%llu interval=%ld output=%s\n",
 	       period_ns / NSEC_PER_USEC,
