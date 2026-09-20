@@ -185,6 +185,17 @@ def fault_record(frame_id, oncpu=6_000_000, fault=16_000_000,
                   threads=threads)
 
 
+# A paced frame that overran anyway: the wait is the pace sleep, and it
+# happened between the two present markers, so it is the display pacing the
+# app. `timer` names the same wait the way a bracket that never opened would.
+def paced_record(frame_id, present=16_000_000, timer=0, oncpu=4_000_000):
+    return record(frame_id,
+                  causes(oncpu=oncpu, block_present=present,
+                         block_timer=timer),
+                  worst_cause="block_present" if present else "block_timer",
+                  frame_ns=oncpu + present + timer)
+
+
 # root slept on a timer and was woken from the timer interrupt
 def timer_record(frame_id):
     return record(frame_id, causes(oncpu=4_000_000, block_timer=20_000_000),
@@ -218,6 +229,8 @@ SPEC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 HEADER_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "src", "hitchtrace.h")
+BENCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "hitchbench.c")
 
 
 def read_enum_causes():
@@ -235,6 +248,25 @@ def read_enum_causes():
         if name and name not in ("HT_CAUSE_PARTITION", "HT_CAUSE_MAX"):
             names.append(name)
     return names
+
+
+def read_bench_classes():
+    """hitchbench's own injector table: {class name: expected bucket}.
+
+    Empty if the table cannot be found, which is a skip rather than a
+    failure: this file is the checker's tests, not the workload's.
+    """
+    try:
+        with open(BENCH_PATH, encoding="utf-8") as f:
+            body = f.read().split("classes[INJ_MAX] = {", 1)[1]
+    except (OSError, IndexError):
+        return {}
+    body = body.split("\n};", 1)[0]
+    out = {}
+    for entry in re.finditer(r'\[INJ_\w+\]\s*=\s*\{\s*"([^"]+)",\s*"([^"]+)"',
+                             body):
+        out[entry.group(1)] = entry.group(2)
+    return out
 
 
 def read_class_specs():
@@ -1005,6 +1037,96 @@ class QuietTest(CliTest):
 
 
 # ---------------------------------------------------------------------------
+# present
+
+
+class PresentTest(CliTest):
+    """A paced app waits for the display, and the bucket must say so."""
+
+    def test_a_paced_run_spends_its_wait_in_present(self):
+        _, hitch = self.files([], [paced_record(i) for i in (5, 15, 25)])
+        text = self.assertPass(["present", hitch])
+        self.assertIn("3 of 3 record(s) spend their wait in HT_BLOCK_PRESENT",
+                      text)
+        self.assertIn("median 16.000 ms", text)
+
+    def test_a_bracket_that_never_opened_names_what_took_the_time(self):
+        # the wait is the same sleep; without the bracket it is a timer wait
+        recs = [paced_record(i, present=0, timer=16_000_000)
+                for i in (5, 15, 25)]
+        _, hitch = self.files([], recs)
+        text = self.assertFail(["present", hitch],
+                               "0 of 3 record(s) spend their wait",
+                               "HT_BLOCK_TIMER (3) instead")
+        self.assertIn("frame 5", text)		# and the frames are printed
+
+    def test_most_of_the_records_is_enough(self):
+        # a frame that overran after another one skips its pace sleep
+        recs = [paced_record(5), paced_record(15),
+                paced_record(25, present=0, timer=16_000_000)]
+        _, hitch = self.files([], recs)
+        self.assertPass(["present", hitch])
+        self.assertFail(["present", hitch, "--min-frac", "1.0"], "2 of 3")
+
+    def test_no_records_is_no_evidence_either_way(self):
+        _, hitch = self.files([], [])
+        text = self.assertPass(["present", hitch])
+        self.assertIn("no records to check", text)
+
+    def test_min_records_demands_evidence(self):
+        _, hitch = self.files([], [paced_record(5)])
+        self.assertPass(["present", hitch, "--min-records", "1"])
+        self.assertFail(["present", hitch, "--min-records", "2"],
+                        "1 record(s), need 2 before the pacing can be judged")
+
+    def test_a_record_that_never_blocked_is_named_that_way(self):
+        _, hitch = self.files([], [record(1, causes(oncpu=HITCH_NS),
+                                          worst_cause="oncpu")])
+        self.assertFail(["present", hitch], "(never blocked)")
+
+    def test_a_bad_fraction_is_a_usage_error(self):
+        _, hitch = self.files([], [paced_record(5)])
+        with self.assertRaises(SystemExit) as cm:
+            self.run_cli(["present", hitch, "--min-frac", "2"])
+        self.assertEqual(cm.exception.code, 2)
+
+
+class NoPresentTest(CliTest):
+    """invariant --no-present: one probe opens the bracket, another closes it.
+
+    Run with the present marker disabled, nothing attached can close it, so
+    hitchtrace must never open it either: any present time at all means every
+    later wait was being quietly renamed.
+    """
+
+    def test_an_empty_bucket_passes_and_says_so(self):
+        _, hitch = self.files([], [timer_record(1), worker_block_record(2)])
+        text = self.assertPass(["invariant", hitch, "--no-present"])
+        self.assertIn("nothing named HT_BLOCK_PRESENT", text)
+        # the option is off by default and says nothing when it is
+        self.assertNotIn("nothing named",
+                         self.assertPass(["invariant", hitch]))
+
+    def test_present_time_without_the_marker_fails(self):
+        _, hitch = self.files([], [paced_record(1)])
+        self.assertPass(["invariant", hitch])	# it still adds up
+        self.assertFail(["invariant", hitch, "--no-present"],
+                        "HT_BLOCK_PRESENT holds 16.000 ms",
+                        "no probe able to close it")
+
+    def test_a_thread_line_betrays_the_bracket_too(self):
+        # the record's own buckets are clean; only another thread of the
+        # process reports present time, which nothing else looks at
+        threads = worker_block_threads() + [
+            thread("hb_worker2", 4245, block_present=3_000_000,
+                   largest=(3_000_000, "block_present", "dma_fence_wait"))]
+        _, hitch = self.files([], [threaded_record(1, threads=threads)])
+        self.assertPass(["invariant", hitch])
+        self.assertFail(["invariant", hitch, "--no-present"],
+                        "hb_worker2/4245: HT_BLOCK_PRESENT holds 3.000 ms")
+
+
+# ---------------------------------------------------------------------------
 # invariant
 
 
@@ -1246,11 +1368,16 @@ class ShellTableTest(unittest.TestCase):
         self.assertTrue(self.rows, "no CLASS_SPECS rows in %s" % SPEC_PATH)
         self.by_class = {row[0]: row for row in self.rows}
 
+    def mode(self, row):
+        """The row's present mode; the column is optional."""
+        return row[8] if len(row) > 8 else ""
+
     def test_every_row_is_a_usable_check(self):
         for row in self.rows:
             with self.subTest(cls=row[0]):
-                # field 8 is optional: extra arguments for `expect`
-                self.assertIn(len(row), (7, 8),
+                # fields 8 and 9 are optional: extra arguments for `expect`,
+                # and the present mode
+                self.assertIn(len(row), (7, 8, 9),
                               "row has %d fields" % len(row))
                 if row[1]:			# the expected bucket
                     bucket = ch.normalize_bucket(row[1])
@@ -1268,7 +1395,8 @@ class ShellTableTest(unittest.TestCase):
                   "worker_cpu": "block_futex", "cpu_spike": "oncpu",
                   "preempt": "runnable", "thousand_cuts": "block_timer",
                   "io": "block_io", "poll": "block_poll",
-                  "fault": "oncpu_fault"}
+                  "fault": "oncpu_fault", "present_long": "block_present",
+                  "present_off": "block_timer"}
         for cls, bucket in expect.items():
             with self.subTest(cls=cls):
                 self.assertIn(cls, self.by_class)
@@ -1295,6 +1423,62 @@ class ShellTableTest(unittest.TestCase):
                 row = self.by_class[cls]
                 self.assertEqual(row[4], self.by_class["io"][4])  # min-frames
                 self.assertEqual(row[6], "-c %s" % cls)
+
+    def test_the_present_class_runs_like_the_others(self):
+        row = self.by_class["present_long"]
+        self.assertEqual(row[4], self.by_class["io"][4])	# min-frames
+        self.assertEqual(row[6], "-c present_long")
+        self.assertEqual(self.mode(row), "")		# the default markers
+
+    def test_the_paced_baseline_asserts_where_its_pacing_went(self):
+        # healthy frames now spend their pacing time inside present
+        self.assertEqual(self.mode(self.by_class["quiet_baseline"]), "paced")
+
+    def test_one_row_runs_with_the_present_marker_disabled(self):
+        off = [row for row in self.rows if self.mode(row) == "off"]
+        self.assertEqual(len(off), 1, "expected exactly one -M \"\" row")
+        # it still injects a class, and still expects that class's bucket:
+        # disabling the marker must not change what anything else is called
+        self.assertIn("-c ", off[0][6])
+        self.assertTrue(off[0][1], "the row expects no bucket")
+
+    def test_the_present_mode_column_is_one_of_three(self):
+        for row in self.rows:
+            with self.subTest(cls=row[0]):
+                self.assertIn(self.mode(row), ("", "paced", "off"))
+
+    def test_the_script_wires_the_present_mode(self):
+        with open(SPEC_PATH, encoding="utf-8") as f:
+            script = f.read()
+        self.assertIn('args+=(-M "")', script)		# the bracket disabled
+        self.assertIn("--no-present", script)		# ... and asserted empty
+        self.assertIn('check present "$hitch" --min-frac "$PRESENT_FRAC"',
+                      script)
+        # a row that runs another class's injection says so with -c, and the
+        # ground truth is asked about that class rather than about the row
+        self.assertIn("gt_class=${bench_args[i + 1]}", script)
+        self.assertIn('--class "$gt_class"', script)
+
+    def test_every_row_runs_a_class_hitchbench_has(self):
+        """The two tables name the same classes and expect the same buckets.
+
+        A row that injects a class hitchbench does not have, or expects a
+        bucket hitchbench's own table disagrees with, is a run wasted on a
+        machine with root.
+        """
+        bench = read_bench_classes()
+        if not bench:
+            self.skipTest("no injector table in %s" % BENCH_PATH)
+        for row in self.rows:
+            args = row[6].split()
+            if "-c" not in args:
+                continue		# the baseline injects nothing
+            cls = args[args.index("-c") + 1]
+            with self.subTest(cls=cls):
+                self.assertIn(cls, bench)
+                if row[1]:
+                    self.assertEqual(ch.normalize_bucket(row[1]),
+                                     ch.normalize_bucket(bench[cls]))
 
     def test_the_invariant_check_weighs_the_carve_outs(self):
         with open(SPEC_PATH, encoding="utf-8") as f:

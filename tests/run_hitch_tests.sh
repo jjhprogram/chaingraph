@@ -20,13 +20,20 @@
 #   build/hitchbench -c CLASS -d SECS -o GT.jsonl
 #	frame loop injecting CLASS into every 20th frame, ground truth to
 #	GT.jsonl, and on stdout once the loop is up:
-#	    hitchbench pid=<pid> root_tid=<tid> binary=<exe> marker=<sym> budget_us=<n>
-#	Those last three are read back and handed to hitchtrace, so the two
-#	agree on the budget and on the uprobe target. The baseline class runs
-#	with -i 0 (never inject) instead of -c.
+#	    hitchbench pid=<pid> root_tid=<tid> binary=<exe> marker=<sym>
+#		budget_us=<n> present_marker=<sym>
+#	The binary, the budget and the markers are read back and handed to
+#	hitchtrace, so the two agree on the budget and on the uprobe targets;
+#	a report without present_marker= simply leaves hitchtrace's own
+#	default in place. The baseline class runs with -i 0 (never inject)
+#	instead of -c.
 #   build/hitchtrace -p PID -b BUDGET_US -o OUT.jsonl -d SECS [-x BIN -m SYM]
+#			[-M PRESENT_SYM]
 #	traces PID for SECS seconds and appends one JSON record per
 #	over-budget frame to OUT.jsonl (appends: the file is removed first).
+#	-m is present entry and -M present return: between the two the root's
+#	blocked time is HT_BLOCK_PRESENT, the display pacing the app. Rows
+#	leave -M at hitchtrace's default unless the table says otherwise.
 #
 # Environment overrides:
 #   TRACE_SECS   seconds hitchtrace traces (default 5, which keeps the whole
@@ -44,6 +51,8 @@
 #                only 1/8 under budget, so on a busy machine some normal
 #                frames really do overrun; each quiet check prints that rate
 #                from the ground truth next to its own verdict.
+#   PRESENT_FRAC share of a paced row's records that must spend their wait in
+#                HT_BLOCK_PRESENT (check_hitches.py present)
 #   TOL_US       partition tolerance for the invariant check, which also
 #                weighs the on-CPU stall buckets against the frame
 #                (check_hitches.py invariant --oncpu-stall)
@@ -69,6 +78,7 @@ WARMUP_SECS=${WARMUP_SECS:-1}
 MIN_FRAC=${MIN_FRAC:-0.5}
 MIN_FRAMES=${MIN_FRAMES:-3}
 MAX_FALSE=${MAX_FALSE:-5}
+PRESENT_FRAC=${PRESENT_FRAC:-0.5}
 TOL_US=${TOL_US:-500}
 BUDGET_US=${BUDGET_US:-}		# default: what hitchbench reports
 BENCH_READY_SECS=10			# wait this long for the pid report
@@ -80,18 +90,25 @@ read -r -a EXTRA_TRACE_ARGS <<<"${HITCHTRACE_ARGS:-}"
 # One row per test:
 #
 #   name|bucket|resolved|chain|min-frames|thread checks|hitchbench arguments
+#       |expect extras|present mode
 #
-# `name` is both the test name and the injector class the ground truth
-# reports; `bucket` is the partition bucket the injected stall must land in
-# and be the largest of, and an empty `bucket` runs only the quiet and
-# invariant checks. `resolved` is inherited/wait_oncpu (how the time the root
-# spent blocked must be explained: any wait a task ended is resolved through
-# that waker, whichever HT_BLOCK_* bucket the wait itself landed in), and
-# `chain` a comma-separated list of hop comms, direct waker first.
+# `name` is the test name, and the injector class the ground truth reports
+# unless the row's hitchbench arguments name another one with -c; `bucket` is
+# the partition bucket the injected stall must land in and be the largest of,
+# and an empty `bucket` runs only the quiet and invariant checks. `resolved`
+# is inherited/wait_oncpu (how the time the root spent blocked must be
+# explained: any wait a task ended is resolved through that waker, whichever
+# HT_BLOCK_* bucket the wait itself landed in), and `chain` a comma-separated
+# list of hop comms, direct waker first.
 # `thread checks` are arguments to `check_hitches.py threads`, which
 # asserts the record's per-thread detail (struct ht_thread) rather than the
 # root's own timeline; an empty field skips that check, and --class and
-# --min-frames are added from this row. The classes and their
+# --min-frames are added from this row.
+# `present mode` is empty for a row traced the way hitchtrace defaults it,
+# `paced` for one whose records must spend their wait in HT_BLOCK_PRESENT
+# (check_hitches.py present), or `off` for one traced with the present marker
+# disabled (-M ""), which must then leave that bucket empty everywhere
+# (check_hitches.py invariant --no-present). The classes and their
 # expected buckets are hitchbench's own table (tests/hitchbench.c,
 # `build/hitchbench -l`); the bucket names are enum ht_cause from
 # src/hitchtrace.h.
@@ -105,6 +122,17 @@ read -r -a EXTRA_TRACE_ARGS <<<"${HITCHTRACE_ARGS:-}"
 # and what makes it a hitch is the share of that time spent in minor page
 # faults, which frame close carves out of HT_ONCPU into HT_ONCPU_FAULT. The
 # invariant check below weighs those carve-outs against the frame.
+#
+# The frame marker is present entry, so the pace sleep that follows it is the
+# display holding the app back rather than the app sleeping: present_long
+# makes that wait long enough to blow the budget (HT_BLOCK_PRESENT), and the
+# paced baseline must show the ordinary pace sleep in the same bucket. A
+# bracket that never opened would name that time after the syscall it blocked
+# in -- HT_BLOCK_TIMER for a sleep-paced loop -- which is what the `present`
+# check fails on. present_off is the other half: the bracket is opened by one
+# probe and closed by another, so a run with no present marker must leave the
+# bucket empty while still naming the sleep class HT_BLOCK_TIMER. It runs the
+# sleep class under its own name, so both rows have their own outputs.
 #
 # The two classes with a thread check are the ones where the per-thread view
 # says something the record alone does not: in worker_block the frame's stall
@@ -124,7 +152,9 @@ CLASS_SPECS=(
 	"io|HT_BLOCK_IO|||$MIN_FRAMES||-c io"
 	"poll|HT_BLOCK_POLL|||$MIN_FRAMES||-c poll"
 	"fault|HT_ONCPU_FAULT|||$MIN_FRAMES||-c fault|--any-size --min-frac 0.30"
-	"quiet_baseline||||||-i 0"
+	"present_long|HT_BLOCK_PRESENT|||$MIN_FRAMES||-c present_long"
+	"present_off|HT_BLOCK_TIMER|||$MIN_FRAMES||-c sleep||off"
+	"quiet_baseline||||||-i 0||paced"
 )
 
 ALL_CLASSES=()
@@ -192,6 +222,7 @@ TARGET_PID=
 ROOT_TID=
 BENCH_BINARY=		# what hitchbench reports about itself, handed on
 BENCH_MARKER=		# to hitchtrace so both probe the same function
+BENCH_PRESENT=		# likewise for the present-return marker, if reported
 BENCH_BUDGET_US=	# and score frames against the same budget
 
 bg_forget() {
@@ -314,7 +345,8 @@ stop_bench() {
 
 # start_bench ARG...: start hitchbench with these injector arguments and wait
 # for its pid report; sets BENCH_PID, TARGET_PID, ROOT_TID and, when the
-# report carries them, BENCH_BINARY, BENCH_MARKER and BENCH_BUDGET_US.
+# report carries them, BENCH_BINARY, BENCH_MARKER, BENCH_PRESENT and
+# BENCH_BUDGET_US.
 # Returns non-zero on failure.
 start_bench() {
 	local log="$OUT/$T_NAME.bench.log" gt="$OUT/$T_NAME.gt.jsonl" i line
@@ -324,6 +356,7 @@ start_bench() {
 	ROOT_TID=
 	BENCH_BINARY=
 	BENCH_MARKER=
+	BENCH_PRESENT=
 	BENCH_BUDGET_US=
 	T_ERRFILES+=("$log")
 	"$HITCHBENCH" "${bench_args[@]}" -d "$BENCH_SECS" -o "$gt" \
@@ -346,6 +379,10 @@ start_bench() {
 			sed -n 's/.* binary=\([^ ]*\).*/\1/p')
 		BENCH_MARKER=$(printf '%s\n' "$line" |
 			sed -n 's/.* marker=\([^ ]*\).*/\1/p')
+		# " marker=" cannot match inside "present_marker=", so the two
+		# read out of the same line without stepping on each other.
+		BENCH_PRESENT=$(printf '%s\n' "$line" |
+			sed -n 's/.* present_marker=\([^ ]*\).*/\1/p')
 		BENCH_BUDGET_US=$(printf '%s\n' "$line" |
 			sed -n 's/.* budget_us=\([0-9][0-9]*\).*/\1/p')
 	fi
@@ -356,7 +393,7 @@ start_bench() {
 		return 1
 	fi
 	[[ -n $BUDGET_US ]] && BENCH_BUDGET_US=$BUDGET_US
-	t_info "hitchbench ${bench_args[*]} -d $BENCH_SECS: pid=$TARGET_PID root_tid=$ROOT_TID budget_us=${BENCH_BUDGET_US:-default}"
+	t_info "hitchbench ${bench_args[*]} -d $BENCH_SECS: pid=$TARGET_PID root_tid=$ROOT_TID budget_us=${BENCH_BUDGET_US:-default}${BENCH_PRESENT:+ present_marker=$BENCH_PRESENT}"
 	sleep "$WARMUP_SECS"
 	return 0
 }
@@ -376,17 +413,25 @@ finish_bench() {
 	fi
 }
 
-# run_hitchtrace OUTFILE: trace TARGET_PID for TRACE_SECS seconds
+# run_hitchtrace OUTFILE [PRESENT_MODE]: trace TARGET_PID for TRACE_SECS
+# seconds; PRESENT_MODE `off` runs with the present marker disabled.
 run_hitchtrace() {
-	local outfile=$1 errfile="$OUT/$T_NAME.stderr" pid rc args=()
+	local outfile=$1 present=${2:-} errfile="$OUT/$T_NAME.stderr"
+	local pid rc note="" args=()
 
 	# -o appends, so start from an empty file
 	rm -f -- "$outfile"
 	[[ -n $BENCH_BUDGET_US ]] && args+=(-b "$BENCH_BUDGET_US")
 	[[ -n $BENCH_BINARY ]] && args+=(-x "$BENCH_BINARY")
 	[[ -n $BENCH_MARKER ]] && args+=(-m "$BENCH_MARKER")
+	if [[ $present == off ]]; then
+		args+=(-M "")		# no probe to close the bracket
+		note=" (present marker disabled: -M '')"
+	elif [[ -n $BENCH_PRESENT ]]; then
+		args+=(-M "$BENCH_PRESENT")
+	fi
 	T_ERRFILES+=("$errfile")
-	t_info "hitchtrace -p $TARGET_PID ${args[*]} -o ${outfile#"$ROOT"/} -d $TRACE_SECS"
+	t_info "hitchtrace -p $TARGET_PID ${args[*]} -o ${outfile#"$ROOT"/} -d $TRACE_SECS$note"
 	# Background + wait keeps Ctrl-C responsive; the watchdog sends SIGINT
 	# (hitchtrace flushes what it has) and SIGKILL 10 s later.
 	timeout -s INT -k 10 "$HT_TIMEOUT" "$HITCHTRACE" -p "$TARGET_PID" \
@@ -408,16 +453,23 @@ run_hitchtrace() {
 
 # ------------------------------------------------------------------ tests
 
-# run_class NAME BUCKET RESOLVED CHAIN MIN_FRAMES THREAD_ARGS BENCH_ARGS EXPECT_ARGS
+# run_class NAME BUCKET RESOLVED CHAIN MIN_FRAMES THREAD_ARGS BENCH_ARGS
+#	    EXPECT_ARGS PRESENT_MODE
 run_class() {
 	local cls=$1 bucket=$2 resolved=$3 chain=$4 min_frames=$5 threads=$6
-	local extra_expect=${8:-}
+	local extra_expect=${8:-} present=${9:-}
 	local gt="$OUT/$cls.gt.jsonl" hitch="$OUT/$cls.hitch.jsonl"
-	local bench_args thread_args extra_args args=()
+	local bench_args thread_args extra_args args=() inv=() gt_class=$cls i
 
 	read -r -a bench_args <<<"$7"
+	# The ground truth names the injector class, which is the row name for
+	# every row running its own class; a row that runs another class under
+	# its own name (present_off) says which with -c.
+	for ((i = 0; i + 1 < ${#bench_args[@]}; i++)); do
+		[[ ${bench_args[i]} == -c ]] && gt_class=${bench_args[i + 1]}
+	done
 	start_bench "${bench_args[@]}" || return
-	run_hitchtrace "$hitch"
+	run_hitchtrace "$hitch" "$present"
 	finish_bench
 
 	if [[ ! -s $gt ]]; then
@@ -434,7 +486,7 @@ run_class() {
 
 	report join "$gt" "$hitch"
 	if [[ -n $bucket ]]; then
-		args=(expect "$gt" "$hitch" --class "$cls" --bucket "$bucket"
+		args=(expect "$gt" "$hitch" --class "$gt_class" --bucket "$bucket"
 		      --min-frac "$MIN_FRAC" --min-frames "${min_frames:-$MIN_FRAMES}")
 		[[ -n $resolved ]] && args+=(--resolved "$resolved")
 		[[ -n $chain ]] && args+=(--chain "$chain")
@@ -446,14 +498,22 @@ run_class() {
 	fi
 	if [[ -n $threads ]]; then
 		read -r -a thread_args <<<"$threads"
-		check threads "$gt" "$hitch" --class "$cls" \
+		check threads "$gt" "$hitch" --class "$gt_class" \
 		      "${thread_args[@]}" \
 		      --min-frames "${min_frames:-$MIN_FRAMES}"
 	fi
 	args=(quiet "$gt" "$hitch" --max-false "$MAX_FALSE")
 	[[ -n $BENCH_BUDGET_US ]] && args+=(--budget-us "$BENCH_BUDGET_US")
 	check "${args[@]}"
-	check invariant "$hitch" --tol-us "$TOL_US" --oncpu-stall
+	# A paced row waits for the display every frame, so its records must
+	# say so; they are the over-budget frames, and there may be none.
+	if [[ $present == paced ]]; then
+		check present "$hitch" --min-frac "$PRESENT_FRAC"
+	fi
+	# Nothing attached a probe able to close the bracket, so nothing may
+	# have been named after present: the never-closing-bracket regression.
+	[[ $present == off ]] && inv=(--no-present)
+	check invariant "$hitch" --tol-us "$TOL_US" --oncpu-stall "${inv[@]}"
 }
 
 # ------------------------------------------------------------------- main
@@ -464,10 +524,11 @@ for cls in "${SELECTED[@]}"; do
 	for spec in "${CLASS_SPECS[@]}"; do
 		[[ ${spec%%|*} == "$cls" ]] || continue
 		IFS='|' read -r c_name c_bucket c_resolved c_chain c_min \
-			c_threads c_args c_extra <<<"$spec"
+			c_threads c_args c_extra c_present <<<"$spec"
 		t_begin "$c_name"
 		run_class "$c_name" "$c_bucket" "$c_resolved" "$c_chain" \
-			"$c_min" "$c_threads" "$c_args" "$c_extra"
+			"$c_min" "$c_threads" "$c_args" "$c_extra" \
+			"$c_present"
 		t_end
 		break
 	done

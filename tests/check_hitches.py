@@ -101,7 +101,17 @@ Subcommands (exit status 0 = pass, 1 = check failed, 2 = usage/IO error):
       reports how many uninjected frames the ground truth itself puts over
       budget, which is the noise floor the gate cannot be blamed for.
 
-  invariant HITCH.jsonl [--tol-us T] [--oncpu-stall]
+  present HITCH.jsonl [--min-frac F] [--min-records N]
+      Fail unless at least F of the records carry HT_BLOCK_PRESENT time.
+      Between the frame marker (present entry) and the present-end marker
+      the root is waiting for the display, so a paced app spends the wait of
+      its healthy frames there; a bracket that never opened leaves that time
+      named after whatever the app blocked in -- HT_BLOCK_TIMER for a loop
+      paced with a sleep -- and the failure says which bucket took it.
+      Records are only the over-budget frames, so there may be none: that
+      passes and says so, unless --min-records demands more.
+
+  invariant HITCH.jsonl [--tol-us T] [--oncpu-stall] [--no-present]
       Fail if a record's partition buckets (HT_ONCPU..HT_BLOCK_OTHER) do not
       sum to frame_ns within T, or if HT_RESOLVED_WAIT_ONCPU +
       HT_RESOLVED_INHERITED exceeds the frame's blocked time (every
@@ -115,7 +125,10 @@ Subcommands (exit status 0 = pass, 1 = check failed, 2 = usage/IO error):
       together they cannot outlast it, and what the carve-out left in
       HT_ONCPU cannot either -- the counter is unsigned, so going below zero
       shows up as a bucket far larger than the frame rather than a negative
-      one.
+      one. With --no-present, instead assert that nothing at all is named
+      HT_BLOCK_PRESENT: that bracket is opened by one probe and closed by
+      another, so a run with the present marker disabled must leave the
+      bucket empty in every record and every thread.
 
 Any FILE may be "-" for stdin.
 """
@@ -151,6 +164,9 @@ ONCPU_STALLS = tuple(i for i in ONCPU_BUCKETS if i != ONCPU)
 # Time the thread was blocked: what the HT_RESOLVED_* pair splits. Runnable
 # and runqueue time is off-CPU too, but nobody woke the thread out of it.
 BLOCKED = tuple(i for i in range(PARTITION) if BUCKETS[i].startswith("block_"))
+# What the present bracket fills: the display pacing the app, rather than
+# whatever syscall the wait inside present happened to block in.
+PRESENT = IDX["block_present"]
 
 BUCKET_ALIASES = {
     "wait_oncpu": "resolved_wait_oncpu",
@@ -229,6 +245,16 @@ def enum_name(bucket: str) -> str:
 def blocked_ns(cause_ns: Sequence[int]) -> int:
     """Everything one timeline spent blocked, across the HT_BLOCK_* buckets."""
     return sum(cause_ns[i] for i in BLOCKED)
+
+
+def largest_blocked(cause_ns: Sequence[int]) -> Optional[str]:
+    """The largest HT_BLOCK_* bucket of one timeline, None if it never blocked.
+
+    What a wait ended up being called, which is the question when a bucket
+    that should have held it is empty.
+    """
+    best = max(BLOCKED, key=lambda i: cause_ns[i])
+    return BUCKETS[best] if cause_ns[best] else None
 
 
 def normalize_flags(value, bits) -> Set[str]:
@@ -1195,6 +1221,56 @@ def cmd_quiet(frames: Sequence[Frame], records: Sequence[Record],
     return False, report
 
 
+def cmd_present(records: Sequence[Record], min_frac: float,
+                min_records: int) -> Tuple[bool, List[str]]:
+    """Assert the pacing wait is named after the display, not after a syscall.
+
+    Between the frame marker (present entry) and the present-end marker the
+    root is waiting for the display, so a paced app spends the wait of its
+    healthy frames in HT_BLOCK_PRESENT. A bracket that never opened leaves
+    that time named after whatever the app blocked in -- HT_BLOCK_TIMER for
+    a loop paced with a sleep -- which is what this check is here to catch.
+    """
+    good = [r for r in records if r.bucket("block_present")]
+    bad = [r for r in records if not r.bucket("block_present")]
+    head = ("%d of %d record(s) spend their wait in HT_BLOCK_PRESENT (%s), "
+            "need %.2f of them"
+            % (len(good), len(records), _pct(len(good), len(records)),
+               min_frac))
+    context = []
+    if good:
+        present = [r.bucket("block_present") for r in good]
+        context.append("present time per record: median %s, largest %s"
+                       % (_ns(int(median(present))), _ns(max(present))))
+
+    if len(records) < min_records:
+        return False, ["FAILED present: %d record(s), need %d before the "
+                       "pacing can be judged"
+                       % (len(records), min_records), head] + context
+    if not records:
+        return True, ["ok: no records to check: no frame went over budget, "
+                      "so nothing here says where the pacing went"]
+    if len(good) >= min_frac * len(records):
+        return True, ["ok: " + head] + context
+
+    report = ["FAILED present: " + head]
+    counts: Dict[str, int] = {}
+    for rec in bad:
+        named = largest_blocked(rec.cause_ns)
+        key = enum_name(named) if named else "(never blocked)"
+        counts[key] = counts.get(key, 0) + 1
+    tally = ", ".join("%s (%d)" % (name, n) for name, n
+                      in sorted(counts.items(), key=lambda kv: -kv[1]))
+    report.append("the %d record(s) without present time name their blocked "
+                  "time %s instead" % (len(bad), tally))
+    report += context
+    for rec in bad[:DIAG_TOP]:
+        report += ["  " + ln for ln in rec.describe()]
+    if len(bad) > DIAG_TOP:
+        report.append("  ... %d more" % (len(bad) - DIAG_TOP))
+    return False, report
+
+
 def thread_problems(rec: Record, tol_ns: int) -> List[str]:
     """Where the record's per-thread detail contradicts the record itself.
 
@@ -1251,8 +1327,31 @@ def oncpu_stall_problems(who: str, cause_ns: Sequence[int], frame_ns: int,
     return problems
 
 
+def no_present_problems(rec: Record) -> List[str]:
+    """--no-present: with no present-end probe the bracket cannot be open.
+
+    HT_BLOCK_PRESENT is opened by the frame marker and closed by the present
+    marker. A run without the second probe must leave the bucket empty; time
+    in it means a bracket was opened that nothing could close, which is the
+    failure that would otherwise quietly rename every later wait.
+    """
+    problems = []
+    if rec.cause_ns[PRESENT]:
+        problems.append("HT_BLOCK_PRESENT holds %s although the present "
+                        "marker was disabled: the bracket opened with no "
+                        "probe able to close it"
+                        % _ns(rec.cause_ns[PRESENT]))
+    for th in rec.threads:
+        if th.cause_ns[PRESENT]:
+            problems.append("%s: HT_BLOCK_PRESENT holds %s although the "
+                            "present marker was disabled"
+                            % (th.label(), _ns(th.cause_ns[PRESENT])))
+    return problems
+
+
 def cmd_invariant(records: Sequence[Record], tol_ns: int,
-                  oncpu_stall: bool = False) -> Tuple[bool, List[str]]:
+                  oncpu_stall: bool = False,
+                  no_present: bool = False) -> Tuple[bool, List[str]]:
     bad: List[Tuple[Record, List[str]]] = []
     for rec in records:
         problems = []
@@ -1276,6 +1375,8 @@ def cmd_invariant(records: Sequence[Record], tol_ns: int,
                 problems += oncpu_stall_problems("%s: " % th.label(),
                                                  th.cause_ns, rec.frame_ns,
                                                  tol_ns)
+        if no_present:
+            problems += no_present_problems(rec)
         problems += thread_problems(rec, tol_ns)
         if problems:
             bad.append((rec, problems))
@@ -1284,11 +1385,12 @@ def cmd_invariant(records: Sequence[Record], tol_ns: int,
     if not bad:
         if not records:
             return True, ["ok: no records to check"]
+        extra = "; on-CPU stalls fit the frame" if oncpu_stall else ""
+        if no_present:
+            extra += "; nothing named HT_BLOCK_PRESENT"
         return True, ["ok: %d record(s) partition frame_ns within %s "
                       "(%d with per-thread detail%s)"
-                      % (len(records), _ns(tol_ns), with_threads,
-                         "; on-CPU stalls fit the frame"
-                         if oncpu_stall else "")]
+                      % (len(records), _ns(tol_ns), with_threads, extra)]
     report = ["FAILED invariant: %d of %d record(s) do not add up"
               % (len(bad), len(records))]
     for rec, problems in bad[:DIAG_TOP]:
@@ -1376,6 +1478,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="frame budget for the ground-truth over-budget rate "
                         "(default: the median budget_ns of the records)")
 
+    pr = sub.add_parser("present",
+                        help="assert the pacing wait is named after the "
+                             "display")
+    pr.add_argument("records")
+    pr.add_argument("--min-frac", type=float, default=0.5,
+                    help="share of the records that must carry "
+                         "HT_BLOCK_PRESENT time (default 0.5)")
+    pr.add_argument("--min-records", type=int, default=0,
+                    help="records needed before the check can judge anything "
+                         "(default 0: no record is no evidence either way)")
+
     i = sub.add_parser("invariant", help="assert the buckets add up")
     i.add_argument("records")
     i.add_argument("--tol-us", type=int, default=500,
@@ -1384,6 +1497,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also assert the buckets carved out of HT_ONCPU "
                         "(faults, reclaim, compaction) fit inside the frame "
                         "and left HT_ONCPU itself no larger than it")
+    i.add_argument("--no-present", dest="no_present", action="store_true",
+                   help="assert nothing is named HT_BLOCK_PRESENT, as "
+                        "nothing can be when the tool ran with the present "
+                        "marker disabled")
     return p
 
 
@@ -1393,7 +1510,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         records, skipped = read_records(args.records)
         frames: List[Frame] = []
-        if args.cmd != "invariant":
+        if args.cmd not in ("invariant", "present"):
             frames, _ = read_ground_truth(args.ground_truth)
             start, end = read_window(args.records)
             traced = in_window(frames, start, end)
@@ -1436,6 +1553,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ok, report = cmd_threads(frames, records, args.cls, args.thread,
                                      buckets, args.min_frac, args.preemptor,
                                      blocked_in, args.min_frames)
+        elif args.cmd == "present":
+            if args.min_frac < 0 or args.min_frac > 1:
+                parser.error("--min-frac must be between 0 and 1")
+            ok, report = cmd_present(records, args.min_frac, args.min_records)
         elif args.cmd == "join":
             ok, report = cmd_join(frames, records, args.verbose)
         elif args.cmd == "quiet":
@@ -1443,7 +1564,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ok, report = cmd_quiet(frames, records, args.max_false, budget)
         else:
             ok, report = cmd_invariant(records, args.tol_us * 1000,
-                                       args.oncpu_stall)
+                                       args.oncpu_stall, args.no_present)
     except ParseError as e:
         print("check_hitches: %s" % e, file=sys.stderr)
         return 2
