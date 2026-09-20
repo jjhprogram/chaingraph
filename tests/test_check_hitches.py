@@ -48,18 +48,46 @@ def hop(comm, ns, cause="oncpu", flags=(), pid=4243):
             "flags": list(flags), "kstack_id": -1}
 
 
+def thread(comm, tid, root=False, largest=None, preemptor=None, open_ns=0,
+           **buckets):
+    """One threads[] entry, spelled as src/hitchtrace.c writes it.
+
+    Buckets are named keyword arguments, as in causes(), but only the ones
+    that partition a timeline: ht_thread has no resolved pair. `largest` is
+    (ns, cause, blocked_in) and `preemptor` (comm, tid, ns); a thread that
+    never went off-CPU has neither, and says so with nulls.
+    """
+    cause_ns = {name: 0 for name in ch.BUCKETS[:ch.PARTITION]}
+    for name, ns in buckets.items():
+        cause_ns[ch.normalize_bucket(name)] = ns
+    largest_ns, largest_cause, blocked_in = largest or (0, None, None)
+    out = {"tid": tid, "comm": comm, "root": root, "cause_ns": cause_ns,
+           "open_ns": open_ns, "preemptor": None,
+           "largest": {"ns": largest_ns, "cause": largest_cause,
+                       "blocked_in": blocked_in, "kstack": []}}
+    if preemptor:
+        p_comm, p_tid, p_ns = preemptor
+        out["preemptor"] = {"tid": p_tid, "tgid": 4200, "comm": p_comm,
+                            "ns": p_ns}
+    return out
+
+
 def record(frame_id, cause_ns, worst_cause="block_task", worst_ns=None,
-           hops=(), frame_ns=HITCH_NS, budget_ns=BUDGET_NS, flags=()):
+           hops=(), frame_ns=HITCH_NS, budget_ns=BUDGET_NS, flags=(),
+           threads=None):
     if worst_ns is None:
         worst_ns = cause_ns[ch.normalize_bucket(worst_cause)]
-    return {"frame_id": frame_id, "root_pid": 4242, "root_tgid": 4200,
-            "root_comm": "hb_root", "frame_start_ns": 1_000_000_000,
-            "frame_end_ns": 1_000_000_000 + frame_ns, "frame_ns": frame_ns,
-            "budget_ns": budget_ns, "nstalls": 2, "flags": list(flags),
-            "cause_ns": cause_ns,
-            "worst": {"ns": worst_ns, "start_ns": 1_000_100_000,
-                      "cause": worst_cause, "kstack_id": 7, "ustack_id": -1,
-                      "hops": list(hops)}}
+    out = {"frame_id": frame_id, "root_pid": 4242, "root_tgid": 4200,
+           "root_comm": "hb_root", "frame_start_ns": 1_000_000_000,
+           "frame_end_ns": 1_000_000_000 + frame_ns, "frame_ns": frame_ns,
+           "budget_ns": budget_ns, "nstalls": 2, "flags": list(flags),
+           "cause_ns": cause_ns,
+           "worst": {"ns": worst_ns, "start_ns": 1_000_100_000,
+                     "cause": worst_cause, "kstack_id": 7, "ustack_id": -1,
+                     "hops": list(hops)}}
+    if threads is not None:		# absent: a record with no thread detail
+        out["threads"] = list(threads)
+    return out
 
 
 # root blocked on a worker that was itself blocked: inherited, one hop
@@ -80,6 +108,39 @@ def worker_busy_record(frame_id):
                          resolved_inherited=1_000_000),
                   hops=[hop("hb_worker", 19_000_000, cause="oncpu",
                             flags=["HT_HOP_ONCPU"])])
+
+
+# The same frame seen per thread: the root's line is the record's own
+# timeline, the worker's is context (it blocked longer than the frame lasted
+# for the root, which is fine: the two ran in parallel).
+def worker_block_threads(**root_overrides):
+    root = dict(oncpu=4_000_000, block_task=20_000_000)
+    root.update(root_overrides)
+    return [thread("hb_root", 4242, root=True,
+                   largest=(19_000_000, "block_task", "pipe_read"), **root),
+            thread("hb_worker", 4243, oncpu=2_000_000, block_task=21_000_000,
+                   largest=(20_000_000, "block_task", "pipe_read"),
+                   preemptor=("hb_hog0", 4250, 900_000))]
+
+
+def threaded_record(frame_id, threads=None, **kwargs):
+    if threads is None:
+        threads = worker_block_threads()
+    return worker_block_record(frame_id, threads=threads, **kwargs)
+
+
+# root pinned with the hogs: runnable, and it can name what took its CPU
+def preempt_record(frame_id, preemptor=("hb_hog0", 4250, 9_000_000)):
+    return record(frame_id,
+                  causes(oncpu=6_000_000, runnable=16_000_000,
+                         runqueue=2_000_000),
+                  worst_cause="runnable",
+                  threads=[thread("hb_root", 4242, root=True,
+                                  oncpu=6_000_000, runnable=16_000_000,
+                                  runqueue=2_000_000,
+                                  largest=(9_000_000, "runnable", None),
+                                  preemptor=preemptor),
+                           thread("hb_hog0", 4250, oncpu=20_000_000)])
 
 
 # root slept on a timer and was woken from the timer interrupt
@@ -233,6 +294,83 @@ class ParseTest(unittest.TestCase):
             ch.read_records(self.write("h.jsonl", [rec]))
 
 
+class ThreadParseTest(unittest.TestCase):
+    """threads[] is new, and old records simply do not carry it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def read(self, rec):
+        path = os.path.join(self._tmp.name, "h.jsonl")
+        write_jsonl(path, [rec])
+        recs, _ = ch.read_records(path)
+        return recs[0]
+
+    def test_a_record_without_threads_has_none(self):
+        self.assertEqual(self.read(worker_block_record(1)).threads, [])
+
+    def test_threads_are_parsed_whole(self):
+        rec = self.read(threaded_record(1))
+        self.assertEqual([t.comm for t in rec.threads],
+                         ["hb_root", "hb_worker"])
+        root, worker = rec.threads
+        self.assertTrue(root.root)
+        self.assertEqual(rec.roots(), [root])
+        self.assertEqual(root.bucket("block_task"), 20_000_000)
+        self.assertEqual(root.largest.cause, "block_task")
+        self.assertEqual(root.largest.blocked_in, "pipe_read")
+        self.assertIsNone(root.preemptor)
+        self.assertFalse(worker.root)
+        self.assertEqual(worker.tid, 4243)
+        self.assertEqual(worker.largest_bucket(), "block_task")
+        self.assertEqual(worker.offcpu_ns(), 21_000_000)	# not the oncpu
+        self.assertEqual(worker.preemptor.comm, "hb_hog0")
+        self.assertEqual(worker.preemptor.ns, 900_000)
+
+    def test_the_root_may_be_spelled_as_a_thread_flag(self):
+        # hitchtrace writes "root": true, but ht_thread.flags carries the
+        # same bit and is how every other flag field of a record is rendered
+        rec = self.read(threaded_record(1, threads=[
+            {"tid": 4242, "comm": "hb_root", "flags": ["HT_THREAD_ROOT"],
+             "cause_ns": {"oncpu": 24_000_000}},
+            {"tid": 4243, "comm": "hb_worker", "flags": 1 << 1,
+             "cause_ns": {"block_task": 5_000_000}, "open_ns": 5_000_000}]))
+        self.assertTrue(rec.threads[0].root)
+        self.assertFalse(rec.threads[1].root)
+        self.assertIn("blocked_end", rec.threads[1].flags)
+
+    def test_preemptor_and_largest_as_flat_keys(self):
+        # the same thread, spelled without the nested objects
+        rec = self.read(threaded_record(1, threads=[
+            {"pid": 4243, "comm": "hb_worker",
+             "cause_ns": {"block_task": 21_000_000},
+             "largest_ns": 20_000_000, "largest_cause": "block_task",
+             "blocked_in": "pipe_read", "preemptor_pid": 4250,
+             "preemptor_comm": "hb_hog0", "preemptor_ns": 900_000}]))
+        th = rec.threads[0]
+        self.assertEqual(th.largest.blocked_in, "pipe_read")
+        self.assertEqual((th.preemptor.tid, th.preemptor.comm), (4250, "hb_hog0"))
+
+    def test_an_empty_preemptor_is_nobody(self):
+        rec = self.read(threaded_record(1, threads=[
+            thread("hb_worker", 4243, block_task=1_000_000)]))
+        self.assertIsNone(rec.threads[0].preemptor)
+
+    def test_threads_must_be_an_array(self):
+        rec = threaded_record(1)
+        rec["threads"] = {"hb_root": 4242}
+        with self.assertRaises(ch.ParseError) as cm:
+            self.read(rec)
+        self.assertIn("threads is dict", str(cm.exception))
+
+    def test_an_unknown_bucket_in_a_thread_is_a_parse_error(self):
+        threads = worker_block_threads()
+        threads[0]["cause_ns"]["gpu_wait"] = 5
+        with self.assertRaises(ch.ParseError):
+            self.read(threaded_record(1, threads=threads))
+
+
 class ChainMatchTest(unittest.TestCase):
     def hops(self):
         return [ch.parse_hop(h, "t") for h in
@@ -282,6 +420,20 @@ class JoinTest(CliTest):
         self.assertIn("1 (50.0%)", text)		# one of those on bucket
         self.assertIn("no record for frame(s): 15", text)
         self.assertIn("frame 14", text)
+
+    def test_thread_count_column(self):
+        frames, recs = scene(
+            injected=(("worker_block", "HT_BLOCK_TASK", 2),
+                      ("timer_sleep", "HT_BLOCK_TIMER", 2)),
+            make_record=lambda fid: (threaded_record(fid) if fid <= 14
+                                     else timer_record(fid)))
+        gt, hitch = self.files(frames, recs)
+        text = self.assertPass(["join", gt, hitch])
+        self.assertIn("threads", text.splitlines()[0])
+        rows = {ln.split()[0]: ln.split() for ln in text.splitlines()[1:4]}
+        self.assertEqual(rows["worker_block"][-1], "2")
+        self.assertEqual(rows["timer_sleep"][-1], "0")	# no detail emitted
+        self.assertEqual(rows[ch.NO_CLASS][-1], "-")	# no records at all
 
     def test_records_outside_the_ground_truth_are_reported(self):
         frames, recs = scene(injected=(("worker_block", "HT_BLOCK_TASK", 1),))
@@ -393,6 +545,184 @@ class ExpectTest(CliTest):
 
 
 # ---------------------------------------------------------------------------
+# threads
+
+
+class ThreadsCommandTest(CliTest):
+    def scene(self, make_record=threaded_record, count=4, **kwargs):
+        frames, recs = scene(injected=(("worker_block", "HT_BLOCK_TASK", count),),
+                             make_record=make_record, **kwargs)
+        return self.files(frames, recs)
+
+    def test_worker_thread_is_found_and_described(self):
+        gt, hitch = self.scene()
+        text = self.assertPass(["threads", gt, hitch, "--class", "worker_block",
+                                "--thread", "hb_worker",
+                                "--bucket", "HT_BLOCK_TASK",
+                                "--blocked-in", "pipe_", "--min-frames", "4"])
+        self.assertIn("4/4", text)
+
+    def test_missing_thread_fails(self):
+        gt, hitch = self.scene()
+        text = self.assertFail(["threads", gt, hitch, "--class", "worker_block",
+                                "--thread", "hb_feeder"],
+                               "no such thread", "hb_feeder")
+        self.assertIn("threads: hb_root/4242, hb_worker/4243", text)
+
+    def test_wrong_bucket_fails(self):
+        gt, hitch = self.scene()
+        self.assertFail(["threads", gt, hitch, "--class", "worker_block",
+                         "--thread", "hb_worker", "--bucket", "HT_BLOCK_IO"],
+                        "wrong bucket", "largest bucket is HT_BLOCK_TASK")
+
+    def test_wrong_preemptor_fails(self):
+        gt, hitch = self.scene()
+        self.assertFail(["threads", gt, hitch, "--class", "worker_block",
+                         "--thread", "hb_worker", "--preemptor", "kworker"],
+                        "wrong preemptor", "preemptor is hb_hog0/4250")
+
+    def test_blocked_in_mismatch_fails(self):
+        gt, hitch = self.scene()
+        self.assertFail(["threads", gt, hitch, "--class", "worker_block",
+                         "--thread", "hb_worker",
+                         "--blocked-in", "futex_wait"],
+                        "blocked-in mismatch", "blocked in 'pipe_read'")
+
+    def test_a_thread_with_no_blocking_stack_cannot_match_blocked_in(self):
+        gt, hitch = self.scene(
+            make_record=lambda fid: threaded_record(
+                fid, threads=[thread("hb_root", 4242, root=True,
+                                     oncpu=4_000_000, block_task=20_000_000)]))
+        self.assertFail(["threads", gt, hitch, "--class", "worker_block",
+                         "--blocked-in", "pipe_"],
+                        "names no kernel function")
+
+    def test_bucket_any_accepts_either_spelling_of_the_stall(self):
+        # the worker's wait shows up as a timer wake on some runs
+        gt, hitch = self.scene(
+            make_record=lambda fid: threaded_record(
+                fid, threads=worker_block_threads() + [
+                    thread("hb_feeder", 4244, block_timer=22_000_000,
+                           largest=(21_000_000, "block_timer",
+                                    "hrtimer_nanosleep"))]))
+        for one in ("HT_BLOCK_TASK", "HT_BLOCK_TIMER"):
+            self.assertPass(["threads", gt, hitch, "--class", "worker_block",
+                             "--thread", "hb_", "--bucket", one,
+                             "--min-frames", "4"])
+        self.assertPass(["threads", gt, hitch, "--class", "worker_block",
+                         "--thread", "hb_feeder",
+                         "--bucket-any", "HT_BLOCK_TASK,HT_BLOCK_TIMER",
+                         "--min-frames", "4"])
+        self.assertFail(["threads", gt, hitch, "--class", "worker_block",
+                         "--thread", "hb_feeder",
+                         "--bucket-any", "HT_BLOCK_TASK,HT_BLOCK_IO"],
+                        "expected HT_BLOCK_TASK or HT_BLOCK_IO")
+
+    def test_bucket_any_weighs_the_buckets_together(self):
+        # one wait spelled two ways: neither half is half the off-CPU time,
+        # but the pair is all of it
+        gt, hitch = self.scene(
+            make_record=lambda fid: threaded_record(
+                fid, threads=worker_block_threads() + [
+                    thread("hb_feeder", 4244, block_task=11_000_000,
+                           block_timer=11_000_000,
+                           largest=(11_000_000, "block_task", "pipe_write"))]))
+        self.assertPass(["threads", gt, hitch, "--class", "worker_block",
+                         "--thread", "hb_feeder",
+                         "--bucket-any", "HT_BLOCK_TASK,HT_BLOCK_TIMER",
+                         "--min-frac", "0.9", "--min-frames", "4"])
+        self.assertFail(["threads", gt, hitch, "--class", "worker_block",
+                         "--thread", "hb_feeder", "--bucket", "HT_BLOCK_TASK",
+                         "--min-frac", "0.9"],
+                        "below --min-frac")
+
+    def test_min_frac_is_measured_against_the_thread_off_cpu_time(self):
+        # 6 ms of the worker's 20 ms off-CPU: the largest, but only 0.30 of it
+        gt, hitch = self.scene(
+            make_record=lambda fid: threaded_record(
+                fid, threads=worker_block_threads() + [
+                    thread("hb_feeder", 4244, oncpu=4_000_000,
+                           runnable=5_000_000, block_task=6_000_000,
+                           block_io=5_000_000, block_timer=4_000_000,
+                           largest=(6_000_000, "block_task", "pipe_write"))]))
+        self.assertPass(["threads", gt, hitch, "--class", "worker_block",
+                         "--thread", "hb_feeder", "--bucket", "HT_BLOCK_TASK",
+                         "--min-frac", "0.25", "--min-frames", "4"])
+        self.assertFail(["threads", gt, hitch, "--class", "worker_block",
+                         "--thread", "hb_feeder", "--bucket", "HT_BLOCK_TASK",
+                         "--min-frac", "0.5"],
+                        "below --min-frac", "0.50 of the 20.000 ms")
+
+    def test_the_root_names_what_took_its_cpu(self):
+        frames, recs = scene(injected=(("preempt", "HT_RUNNABLE", 3),),
+                             make_record=preempt_record)
+        gt, hitch = self.files(frames, recs)
+        self.assertPass(["threads", gt, hitch, "--class", "preempt",
+                         "--thread", "hb_root", "--bucket", "HT_RUNNABLE",
+                         "--preemptor", "hb_hog", "--min-frames", "3"])
+
+    def test_a_root_nothing_preempted_fails(self):
+        frames, recs = scene(injected=(("preempt", "HT_RUNNABLE", 3),),
+                             make_record=lambda fid: preempt_record(fid,
+                                                                    preemptor=None))
+        gt, hitch = self.files(frames, recs)
+        self.assertFail(["threads", gt, hitch, "--class", "preempt",
+                         "--thread", "hb_root", "--preemptor", "hb_hog"],
+                        "nothing took this thread's CPU")
+
+    def test_records_without_thread_detail_fail(self):
+        gt, hitch = self.scene(make_record=worker_block_record)
+        self.assertFail(["threads", gt, hitch, "--class", "worker_block",
+                         "--thread", "hb_worker"],
+                        "no threads", "carries no per-thread detail")
+
+    def test_a_frame_with_no_record_at_all(self):
+        gt, hitch = self.scene(records_for={13, 14})
+        text = self.assertFail(["threads", gt, hitch, "--class", "worker_block",
+                                "--thread", "hb_worker", "--min-frames", "3"],
+                               "produced no record")
+        self.assertIn("2/4", text)
+        self.assertPass(["threads", gt, hitch, "--class", "worker_block",
+                         "--thread", "hb_worker", "--min-frames", "2"])
+
+    def test_diagnostics_print_the_thread_table(self):
+        gt, hitch = self.scene()
+        text = self.assertFail(["threads", gt, hitch, "--class", "worker_block",
+                                "--thread", "hb_worker",
+                                "--bucket", "HT_BLOCK_IO"],
+                               "threads (2):")
+        self.assertIn("* hb_root/4242: oncpu 4.000 ms  block_task 20.000 ms",
+                      text)
+        self.assertIn("largest block_task 20.000 ms in pipe_read", text)
+        self.assertIn("preempted by hb_hog0/4250 for 0.900 ms", text)
+
+    def test_without_thread_any_thread_may_answer(self):
+        gt, hitch = self.scene()
+        self.assertPass(["threads", gt, hitch, "--class", "worker_block",
+                         "--preemptor", "hb_hog", "--min-frames", "4"])
+
+    def test_unknown_class_names_what_is_there(self):
+        gt, hitch = self.scene()
+        self.assertFail(["threads", gt, hitch, "--class", "reclaim",
+                         "--thread", "hb_worker"],
+                        "no frame injected with 'reclaim'", "worker_block")
+
+    def test_a_resolution_bucket_is_a_usage_error(self):
+        gt, hitch = self.scene()
+        with self.assertRaises(SystemExit) as cm:
+            self.run_cli(["threads", gt, hitch, "--class", "worker_block",
+                          "--bucket", "HT_RESOLVED_INHERITED"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_a_bad_regex_is_a_usage_error(self):
+        gt, hitch = self.scene()
+        with self.assertRaises(SystemExit) as cm:
+            self.run_cli(["threads", gt, hitch, "--class", "worker_block",
+                          "--blocked-in", "pipe_("])
+        self.assertEqual(cm.exception.code, 2)
+
+
+# ---------------------------------------------------------------------------
 # quiet
 
 
@@ -468,6 +798,61 @@ class InvariantTest(CliTest):
 
     def test_no_records_is_vacuously_fine(self):
         _, hitch = self.files([], [])
+        self.assertPass(["invariant", hitch])
+
+
+class InvariantThreadsTest(CliTest):
+    """threads[] and the record are two views of one frame; they must agree."""
+
+    def test_the_root_line_matches_the_record(self):
+        _, hitch = self.files([], [threaded_record(1), preempt_record(2)])
+        text = self.assertPass(["invariant", hitch])
+        self.assertIn("2 with per-thread detail", text)
+
+    def test_records_without_threads_are_not_checked_for_a_root(self):
+        _, hitch = self.files([], [worker_block_record(1)])
+        text = self.assertPass(["invariant", hitch])
+        self.assertIn("0 with per-thread detail", text)
+
+    def test_exactly_one_thread_must_be_the_root(self):
+        two = worker_block_threads()
+        two[1]["root"] = True				# the worker too
+        _, hitch = self.files([], [threaded_record(1, threads=two)])
+        self.assertFail(["invariant", hitch],
+                        "2 of 2 thread(s) are flagged as the root",
+                        "hb_root/4242, hb_worker/4243")
+
+        none = worker_block_threads()
+        none[0]["root"] = False
+        _, hitch = self.files([], [threaded_record(1, threads=none)])
+        self.assertFail(["invariant", hitch],
+                        "0 of 2 thread(s) are flagged as the root")
+
+    def test_the_root_buckets_must_match_the_top_level_ones(self):
+        # the root's line says the wait was a timer, the record says a task
+        threads = worker_block_threads(block_task=0, block_timer=20_000_000)
+        _, hitch = self.files([], [threaded_record(1, threads=threads)])
+        text = self.assertFail(["invariant", hitch],
+                               "the root thread hb_root/4242 and the record "
+                               "disagree")
+        self.assertIn("block_task: root 0.000 ms, record 20.000 ms", text)
+        self.assertIn("block_timer: root 20.000 ms, record 0.000 ms", text)
+        self.assertIn("threads (2):", text)		# the table is printed
+
+    def test_a_small_disagreement_is_within_tolerance(self):
+        threads = worker_block_threads(oncpu=4_400_000)	# 400 us over
+        _, hitch = self.files([], [threaded_record(1, threads=threads)])
+        self.assertPass(["invariant", hitch])
+        self.assertFail(["invariant", hitch, "--tol-us", "100"],
+                        "oncpu: root 4.400 ms, record 4.000 ms")
+
+    def test_other_threads_never_have_to_add_up(self):
+        # hb_worker reports 23 ms in a 24 ms frame and is off-CPU at the end:
+        # it ran in parallel, so none of that is the frame's to explain
+        threads = worker_block_threads()
+        threads[1]["open_ns"] = 5_000_000
+        _, hitch = self.files([], [threaded_record(1, threads=threads,
+                                                   flags=["open_stall"])])
         self.assertPass(["invariant", hitch])
 
 

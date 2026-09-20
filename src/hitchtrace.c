@@ -218,7 +218,7 @@ static const char *const hop_flag_names[] = {
 	"irq", "softirq", "irqexit", "idle", "oncpu", "trunc", "stale",
 };
 static const char *const frame_flag_names[] = {
-	"open_stall", "no_root_state", "lost",
+	"open_stall", "no_root_state", "lost", "threads_full",
 };
 
 /* comm from BPF is a fixed-size field and need not be NUL-terminated */
@@ -479,6 +479,7 @@ static void print_chain(const struct ht_stall *st)
 
 static void frame_flags_str(char *buf, size_t sz, __u32 flags)
 {
+	/* HT_FRAME_THREADS_FULL is left out: the threads block says so itself */
 	static const char *const names[] = {
 		"open stall", "partial frame", "lost accounting",
 	};
@@ -499,6 +500,168 @@ static void frame_flags_str(char *buf, size_t sz, __u32 flags)
 	}
 	if (len)
 		snprintf(buf, sz, "%s]", tmp);
+}
+
+/* ---- per-thread detail -------------------------------------------------- */
+
+#define THREAD_LINES	8	/* thread lines printed per record */
+
+/* snprintf that appends, keeping *len in step and dropping what does not fit */
+static void append(char *buf, size_t sz, size_t *len, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (*len + 1 >= sz)
+		return;
+	va_start(ap, fmt);
+	n = vsnprintf(buf + *len, sz - *len, fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return;
+	*len = (size_t)n < sz - *len ? *len + (size_t)n : sz - 1;
+}
+
+/*
+ * Off-CPU time of one thread inside the frame window: every bucket but
+ * on-CPU. This orders the lines; it is never added to the frame, which only
+ * the root's timeline partitions. open_ns is deliberately left out: a thread
+ * that slept through the whole frame has nothing but open time, and it is
+ * context rather than the frame's problem. It is still printed, last.
+ */
+static __u64 thread_offcpu_ns(const struct ht_thread *t)
+{
+	__u64 ns = 0;
+
+	for (__u32 i = 0; i < HT_CAUSE_PARTITION; i++)
+		if (i != HT_ONCPU)
+			ns += t->cause_ns[i];
+	return ns;
+}
+
+/* A thread the frame never scheduled has nothing to say about it. */
+static bool thread_has_detail(const struct ht_thread *t)
+{
+	if (t->open_ns)
+		return true;
+	for (__u32 i = 0; i < HT_CAUSE_PARTITION; i++)
+		if (t->cause_ns[i])
+			return true;
+	return false;
+}
+
+/*
+ * Threads worth printing, root first and the rest by descending off-CPU time,
+ * as indices into r->threads[]. Insertion sort: at most HT_MAX_THREADS of them.
+ */
+static __u32 thread_order(const struct ht_record *r, __u32 *idx)
+{
+	__u32 n = 0, nthreads = r->nthreads;
+
+	if (nthreads > HT_MAX_THREADS)
+		nthreads = HT_MAX_THREADS;
+	for (__u32 i = 0; i < nthreads; i++) {
+		const struct ht_thread *t = &r->threads[i];
+		bool root = t->flags & HT_THREAD_ROOT;
+		__u64 ns = thread_offcpu_ns(t);
+		__u32 j;
+
+		if (!thread_has_detail(t))
+			continue;
+		for (j = n; j > 0; j--) {
+			const struct ht_thread *p = &r->threads[idx[j - 1]];
+
+			if (p->flags & HT_THREAD_ROOT)
+				break;
+			if (!root && thread_offcpu_ns(p) >= ns)
+				break;
+			idx[j] = idx[j - 1];
+		}
+		idx[j] = i;
+		n++;
+	}
+	return n;
+}
+
+/* The buckets a thread spent time in, then what stands out about its frame. */
+static void thread_detail(char *buf, size_t sz, const struct ht_thread *t)
+{
+	const char *where;
+	size_t len = 0;
+
+	buf[0] = '\0';
+	for (__u32 i = 0; i < HT_CAUSE_PARTITION; i++)
+		if (t->cause_ns[i])
+			append(buf, sz, &len, "%s%s %.1f", len ? "  " : "",
+			       cause_names[i], ms(t->cause_ns[i]));
+	/* HT_THREAD_BLOCKED_END: the tail of an interval the frame outlived */
+	if (t->open_ns)
+		append(buf, sz, &len, "%s(still blocked at frame end %.1f ms)",
+		       len ? " " : "", ms(t->open_ns));
+	/*
+	 * The root's longest interval is the worst stall, printed above with
+	 * its chain; for the other threads this is the only place it shows.
+	 */
+	where = t->largest_ns && !(t->flags & HT_THREAD_ROOT) ?
+		blocked_in(t->largest_kstack) : NULL;
+	if (where)
+		append(buf, sz, &len, "   largest %.1f ms in %s",
+		       ms(t->largest_ns), where);
+	if (t->preemptor_ns) {
+		char who[TASK_COMM_LEN + 24];
+
+		task_label(who, sizeof(who), t->preemptor_comm, t->preemptor_pid);
+		append(buf, sz, &len, "   preempted by %s for %.1f ms", who,
+		       ms(t->preemptor_ns));
+	}
+}
+
+/*
+ * The other threads of the process, as context for the frame: they run in
+ * parallel, so their off-CPU time is not part of the frame and is never
+ * summed into it.
+ */
+static void print_threads(const struct ht_record *r)
+{
+	char labels[HT_MAX_THREADS][TASK_COMM_LEN + 24];
+	__u32 idx[HT_MAX_THREADS], n, shown;
+	bool any_root = false;
+	int width = 0;
+
+	n = thread_order(r, idx);
+	if (!n && !(r->flags & HT_FRAME_THREADS_FULL))
+		return;
+	shown = n < THREAD_LINES ? n : THREAD_LINES;
+	for (__u32 i = 0; i < shown; i++) {
+		const struct ht_thread *t = &r->threads[idx[i]];
+		int len;
+
+		task_label(labels[i], sizeof(labels[i]), t->comm, t->pid);
+		len = (int)strlen(labels[i]);
+		if (len > width)
+			width = len;
+		if (t->flags & HT_THREAD_ROOT)
+			any_root = true;
+	}
+
+	printf("  threads\n");
+	for (__u32 i = 0; i < shown; i++) {
+		const struct ht_thread *t = &r->threads[idx[i]];
+		char detail[320];
+
+		thread_detail(detail, sizeof(detail), t);
+		if (any_root)
+			printf("    %-*s  %-6s  %s\n", width, labels[i],
+			       (t->flags & HT_THREAD_ROOT) ? "(root)" : "",
+			       detail);
+		else
+			printf("    %-*s  %s\n", width, labels[i], detail);
+	}
+	if (n > shown)
+		printf("    ... and %u more\n", n - shown);
+	if (r->flags & HT_FRAME_THREADS_FULL)
+		printf("    (thread list truncated at %d threads)\n",
+		       HT_MAX_THREADS);
 }
 
 static void print_record(const struct ht_record *r)
@@ -537,6 +700,7 @@ static void print_record(const struct ht_record *r)
 			       cause_phrase(r->worst.cause));
 		print_chain(&r->worst);
 	}
+	print_threads(r);
 	printf("  %u stall%s this frame\n\n", r->nstalls, r->nstalls == 1 ? "" : "s");
 	fflush(stdout);
 }
@@ -637,13 +801,80 @@ static void json_hop(FILE *f, const struct ht_hop *h)
 	fputc('}', f);
 }
 
+/*
+ * One thread's frame. cause_ns holds only the partition buckets, and for
+ * every thread but the root it is context, not a share of frame_ns.
+ */
+static void json_thread(FILE *f, const struct ht_thread *t)
+{
+	/* largest_kstack is only meaningful once there is an interval */
+	const char *where = t->largest_ns ? blocked_in(t->largest_kstack) : NULL;
+
+	fprintf(f, "{\"tid\":%u,\"comm\":", t->pid);
+	json_comm(f, t->comm);
+	fprintf(f, ",\"root\":%s",
+		(t->flags & HT_THREAD_ROOT) ? "true" : "false");
+
+	fprintf(f, ",\"cause_ns\":{");
+	for (__u32 i = 0; i < HT_CAUSE_PARTITION; i++) {
+		fprintf(f, "%s", i ? "," : "");
+		json_str(f, cause_names[i]);
+		fprintf(f, ":%llu", (unsigned long long)t->cause_ns[i]);
+	}
+	fprintf(f, "},\"open_ns\":%llu", (unsigned long long)t->open_ns);
+	fprintf(f, ",\"flags\":[");
+	if (t->flags & HT_THREAD_ROOT)
+		fprintf(f, "\"root\"");
+	if (t->flags & HT_THREAD_BLOCKED_END)
+		fprintf(f, "%s\"blocked_at_frame_end\"",
+			(t->flags & HT_THREAD_ROOT) ? "," : "");
+	fprintf(f, "]");
+
+	/*
+	 * largest_* only means anything once there was an interval; with no
+	 * off-CPU time at all the cause is null rather than a bucket name
+	 * that nothing was spent in.
+	 */
+	fprintf(f, ",\"largest\":{\"ns\":%llu,\"cause\":",
+		(unsigned long long)t->largest_ns);
+	if (!t->largest_ns)
+		fprintf(f, "null");
+	else
+		json_str(f, t->largest_cause < HT_CAUSE_MAX ?
+			    cause_names[t->largest_cause] : "unknown");
+	fprintf(f, ",\"blocked_in\":");
+	if (where)
+		json_str(f, where);
+	else
+		fprintf(f, "null");
+	fprintf(f, ",\"kstack\":");
+	if (t->largest_ns)
+		json_kstack(f, t->largest_kstack);
+	else
+		fprintf(f, "[]");
+
+	fprintf(f, "},\"preemptor\":");
+	if (t->preemptor_ns) {
+		fprintf(f, "{\"tid\":%u,\"tgid\":%u,\"comm\":",
+			t->preemptor_pid, t->preemptor_tgid);
+		json_comm(f, t->preemptor_comm);
+		fprintf(f, ",\"ns\":%llu}", (unsigned long long)t->preemptor_ns);
+	} else {
+		fprintf(f, "null");
+	}
+	fputc('}', f);
+}
+
 static void json_record(FILE *f, const struct ht_record *r)
 {
 	const char *where = blocked_in(r->worst.kstack_id);
 	__u32 nhops = r->worst.nhops;
+	__u32 nthreads = r->nthreads;
 
 	if (nhops > HT_MAX_HOPS)
 		nhops = HT_MAX_HOPS;
+	if (nthreads > HT_MAX_THREADS)
+		nthreads = HT_MAX_THREADS;
 
 	fprintf(f, "{\"frame_id\":%llu", (unsigned long long)r->frame_id);
 	fprintf(f, ",\"root_pid\":%u,\"root_tgid\":%u,\"root_comm\":",
@@ -689,7 +920,19 @@ static void json_record(FILE *f, const struct ht_record *r)
 		fprintf(f, "%s", i ? "," : "");
 		json_hop(f, &r->worst.hops[i]);
 	}
-	fprintf(f, "]}}\n");
+	fprintf(f, "]}");
+
+	/* every thread the frame saw, in slot order, or nothing at all */
+	if (nthreads) {
+		fprintf(f, ",\"threads\":[");
+		for (__u32 i = 0; i < nthreads; i++) {
+			fprintf(f, "%s", i ? "," : "");
+			json_thread(f, &r->threads[i]);
+		}
+		fputc(']', f);
+	}
+
+	fprintf(f, "}\n");
 	fflush(f);
 }
 
@@ -738,6 +981,7 @@ static void print_stats(struct hitchtrace_bpf *obj)
 		[HT_STAT_UNRESOLVED] = "unresolved",
 		[HT_STAT_STORAGE_FAIL] = "storage-fail",
 		[HT_STAT_STACK_ERR] = "stack-err",
+		[HT_STAT_SLOTS_FULL] = "slots-full",
 	};
 	__u64 totals[HT_STAT_MAX] = {};
 	int ncpus = libbpf_num_possible_cpus();
@@ -792,6 +1036,12 @@ static void print_stats(struct hitchtrace_bpf *obj)
 		fprintf(stderr, "warning: %llu stack collection failures; some "
 			"stalls have no blocking stack\n",
 			(unsigned long long)totals[HT_STAT_STACK_ERR]);
+	if (totals[HT_STAT_SLOTS_FULL])
+		fprintf(stderr, "warning: %llu threads found no per-thread slot "
+			"(more than %d threads ran); their detail is missing "
+			"from the records\n",
+			(unsigned long long)totals[HT_STAT_SLOTS_FULL],
+			HT_MAX_THREADS);
 	if (nshort)
 		fprintf(stderr, "warning: %llu short ring buffer records ignored "
 			"(BPF/userspace contract mismatch?)\n", nshort);

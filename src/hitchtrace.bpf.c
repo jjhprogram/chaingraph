@@ -772,6 +772,14 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 				}
 				rec->nthreads = nthreads;
 				rec->__pad = 0;
+				/* more threads ran than there are slots */
+				i = 0;
+				{
+					__u32 *used = bpf_map_lookup_elem(&slot_next, &i);
+
+					if (used && *used > HT_MAX_THREADS)
+						rec->flags |= HT_FRAME_THREADS_FULL;
+				}
 				bpf_ringbuf_submit(rec, 0);
 				stat_inc(HT_STAT_EMITTED);
 			}
