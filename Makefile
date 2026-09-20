@@ -21,9 +21,8 @@ CFLAGS      := -g -O2 -Wall -Wextra -Wno-unused-parameter
 BPF_CFLAGS  := -g -O2 -Wall -Wno-unused-function -Wno-missing-declarations -mcpu=v3 -D__TARGET_ARCH_$(ARCH)
 LDLIBS      := -lelf -lz
 
-APP         := chaingraph
-USER_SRCS   := src/chaingraph.c src/syms.c
-USER_OBJS   := $(patsubst src/%.c,$(OUTPUT)/%.o,$(USER_SRCS))
+APPS        := chaingraph hitchtrace
+BENCHES     := chainload hitchbench
 
 ifeq ($(V),1)
 Q =
@@ -33,8 +32,8 @@ Q = @
 msg = @printf '  %-8s %s\n' "$(1)" "$(2)";
 endif
 
-.PHONY: all clean test
-all: $(OUTPUT)/$(APP) $(OUTPUT)/chainload
+.PHONY: all clean test test-hitch
+all: $(addprefix $(OUTPUT)/,$(APPS) $(BENCHES))
 
 $(OUTPUT) $(OUTPUT)/libbpf:
 	$(call msg,MKDIR,$@)
@@ -54,7 +53,7 @@ $(OUTPUT)/vmlinux.h: | $(OUTPUT)
 	$(call msg,BTF,$@)
 	$(Q)$(BPFTOOL) btf dump file $(VMLINUX_BTF) format c > $@
 
-$(OUTPUT)/%.bpf.o: src/%.bpf.c src/chaingraph.h $(OUTPUT)/vmlinux.h $(LIBBPF_OBJ) | $(OUTPUT)
+$(OUTPUT)/%.bpf.o: src/%.bpf.c src/%.h $(OUTPUT)/vmlinux.h $(LIBBPF_OBJ) | $(OUTPUT)
 	$(call msg,BPF,$@)
 	$(Q)$(CLANG) $(BPF_CFLAGS) -target bpf $(INCLUDES) -c $< -o $@.tmp
 	$(Q)$(BPFTOOL) gen object $@ $@.tmp
@@ -64,7 +63,8 @@ $(OUTPUT)/%.skel.h: $(OUTPUT)/%.bpf.o | $(OUTPUT)
 	$(call msg,GEN-SKEL,$@)
 	$(Q)$(BPFTOOL) gen skeleton $< > $@
 
-$(OUTPUT)/chaingraph.o: src/chaingraph.c src/chaingraph.h src/syms.h $(OUTPUT)/chaingraph.skel.h $(LIBBPF_OBJ)
+# each tool: src/<app>.c + its skeleton, linked with the symbolizer
+$(OUTPUT)/%.o: src/%.c src/%.h src/syms.h $(OUTPUT)/%.skel.h $(LIBBPF_OBJ)
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
@@ -72,17 +72,25 @@ $(OUTPUT)/syms.o: src/syms.c src/syms.h | $(OUTPUT)
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(OUTPUT)/$(APP): $(USER_OBJS) $(LIBBPF_OBJ)
+$(addprefix $(OUTPUT)/,$(APPS)): $(OUTPUT)/%: $(OUTPUT)/%.o $(OUTPUT)/syms.o $(LIBBPF_OBJ)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
-# synthetic wakeup-chain workload used by tests/run_tests.sh
+# synthetic workloads used by the test scripts
 $(OUTPUT)/chainload: tests/chainload.c | $(OUTPUT)
 	$(call msg,CC,$@)
 	$(Q)$(CC) -g -O1 -fno-omit-frame-pointer -Wall -Wextra $< -o $@
 
+# the frame marker must stay in the symbol table for the uprobe
+$(OUTPUT)/hitchbench: tests/hitchbench.c | $(OUTPUT)
+	$(call msg,CC,$@)
+	$(Q)$(CC) -g -O1 -fno-omit-frame-pointer -Wall -Wextra -pthread $< -o $@
+
 test: all
 	tests/run_tests.sh
+
+test-hitch: all
+	tests/run_hitch_tests.sh
 
 clean:
 	$(call msg,CLEAN)
