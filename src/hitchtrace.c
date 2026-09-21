@@ -50,6 +50,10 @@ static struct env {
 	const char *binary;
 	const char *marker;
 	const char *present_marker;
+	__u32 budget_mode;
+	double median_factor;
+	double share;
+	long min_budget_us;
 	const char *jsonl;
 	int hops;
 	long duration;
@@ -61,12 +65,19 @@ static struct env {
 	.min_stall_us = DEFAULT_MIN_STALL_US,
 	.marker = DEFAULT_MARKER,
 	.present_marker = DEFAULT_PRESENT_MARKER,
+	.budget_mode = HT_BUDGET_FIXED,
+	.median_factor = 1.5,
+	.min_budget_us = 2000,
 	.hops = HT_MAX_HOPS,
 };
 
 enum {
 	OPT_MIN_STALL = 0x100,
 	OPT_HOPS,
+	OPT_BUDGET_MODE,
+	OPT_MEDIAN_FACTOR,
+	OPT_MIN_BUDGET,
+	OPT_SHARE,
 };
 
 const char *argp_program_version = "hitchtrace 0.1";
@@ -93,7 +104,8 @@ static const struct argp_option opts[] = {
 	{ "present-marker", 'M', "SYMBOL", 0,
 	  "Present-return marker; time between it and the frame marker is the "
 	  "display pacing the app (default " DEFAULT_PRESENT_MARKER
-	  ", \"\" to disable)", 0 },
+	  ", \"\" to disable). \"ret:\" alone means \"when the frame marker "
+	  "itself returns\", which is what a real present call needs", 0 },
 	{ "jsonl", 'o', "FILE", 0, "Also append one JSON object per hitch to FILE", 0 },
 	{ "duration", 'd', "SECONDS", 0,
 	  "Stop after this many seconds (default: until Ctrl-C or target exit)", 0 },
@@ -103,6 +115,17 @@ static const struct argp_option opts[] = {
 	  "Ignore blocked intervals shorter than this when picking the worst "
 	  "stall (default 100)", 0 },
 	{ "hops", OPT_HOPS, "N", 0, "Chain hops to print, 1-5 (default 5)", 0 },
+	{ "budget-mode", OPT_BUDGET_MODE, "fixed|median", 0,
+	  "fixed: -b is the budget. median: the budget follows the app, "
+	  "rolling median of the last 19 frames x --median-factor "
+	  "(for an app with no frame cap)", 0 },
+	{ "median-factor", OPT_MEDIAN_FACTOR, "F", 0,
+	  "Multiplier on the median budget (default 1.5)", 0 },
+	{ "min-budget", OPT_MIN_BUDGET, "USEC", 0,
+	  "Floor for the median budget (default 2000)", 0 },
+	{ "share", OPT_SHARE, "F", 0,
+	  "Require this share of the frame's excess to be kernel-observable "
+	  "before emitting, 0..1 (default 0: gate on the overrun alone)", 0 },
 	{ "verbose", 'v', NULL, 0, "Verbose libbpf output", 0 },
 	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
@@ -159,6 +182,33 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case 'd':
 		env.duration = parse_long(arg, 1, LONG_MAX, state, "duration");
+		break;
+	case OPT_BUDGET_MODE:
+		if (!strcmp(arg, "fixed")) {
+			env.budget_mode = HT_BUDGET_FIXED;
+		} else if (!strcmp(arg, "median")) {
+			env.budget_mode = HT_BUDGET_MEDIAN;
+		} else {
+			fprintf(stderr, "invalid --budget-mode: %s\n", arg);
+			argp_usage(state);
+		}
+		break;
+	case OPT_MEDIAN_FACTOR:
+		env.median_factor = strtod(arg, NULL);
+		if (env.median_factor < 1.0 || env.median_factor > 100.0) {
+			fprintf(stderr, "--median-factor must be 1.0..100.0\n");
+			argp_usage(state);
+		}
+		break;
+	case OPT_MIN_BUDGET:
+		env.min_budget_us = parse_long(arg, 0, LONG_MAX, state, "min budget");
+		break;
+	case OPT_SHARE:
+		env.share = strtod(arg, NULL);
+		if (env.share < 0.0 || env.share > 1.0) {
+			fprintf(stderr, "--share must be 0..1\n");
+			argp_usage(state);
+		}
 		break;
 	case OPT_MIN_STALL:
 		env.min_stall_us = parse_long(arg, 0, MAX_US, state, "min stall time");
@@ -653,6 +703,8 @@ static __u64 thread_offcpu_ns(const struct ht_thread *t)
 /* A thread the frame never scheduled has nothing to say about it. */
 static bool thread_has_detail(const struct ht_thread *t)
 {
+	if (!t->pid)			/* an unused per-thread slot */
+		return false;
 	if (t->open_ns)
 		return true;
 	for (__u32 i = 0; i < HT_CAUSE_PARTITION; i++)
@@ -847,9 +899,18 @@ static void print_record(const struct ht_record *r)
 
 	task_label(root, sizeof(root), r->root_comm, r->root_pid);
 	frame_flags_str(flags, sizeof(flags), r->flags);
-	printf("hitch frame %llu  %.1f ms  (budget %.1f ms, over by %.1f ms)  root %s%s\n",
+	printf("hitch frame %llu  %.1f ms  (budget %.1f ms, over by %.1f ms",
 	       (unsigned long long)r->frame_id, ms(r->frame_ns), ms(r->budget_ns),
-	       ms(over), root, flags);
+	       ms(over));
+	/*
+	 * What the gate weighed: the frame's time that was neither the app
+	 * running nor the display holding it back, as a share of the overrun.
+	 * That share is what --share thresholds.
+	 */
+	if (over)
+		printf(", %.0f%% kernel-observable",
+		       100.0 * (double)r->stall_ns / (double)over);
+	printf(")  root %s%s\n", root, flags);
 	print_timeline(r);
 
 	if (r->worst.ns) {
@@ -1057,6 +1118,7 @@ static void json_record(FILE *f, const struct ht_record *r)
 	}
 	fputc('}', f);
 
+	fprintf(f, ",\"stall_ns\":%llu", (unsigned long long)r->stall_ns);
 	fprintf(f, ",\"nstalls\":%u,\"flags\":", r->nstalls);
 	json_flags(f, r->flags, frame_flag_names,
 		   sizeof(frame_flag_names) / sizeof(frame_flag_names[0]));
@@ -1084,14 +1146,23 @@ static void json_record(FILE *f, const struct ht_record *r)
 	}
 	fprintf(f, "]}");
 
-	/* every thread the frame saw, in slot order, or nothing at all */
-	if (nthreads) {
-		fprintf(f, ",\"threads\":[");
+	/*
+	 * Every thread the frame saw, in slot order. The kernel writes each
+	 * thread into its own slot, so unused slots come through with pid 0
+	 * and are skipped here.
+	 */
+	{
+		bool first = true;
+
 		for (__u32 i = 0; i < nthreads; i++) {
-			fprintf(f, "%s", i ? "," : "");
+			if (!r->threads[i].pid)
+				continue;
+			fprintf(f, "%s", first ? ",\"threads\":[" : ",");
 			json_thread(f, &r->threads[i]);
+			first = false;
 		}
-		fputc(']', f);
+		if (!first)
+			fputc(']', f);
 	}
 
 	fprintf(f, "}\n");
@@ -1290,6 +1361,10 @@ static struct hitchtrace_bpf *open_and_load(bool with_irq_hooks, int *errp)
 
 	obj->rodata->targ_tgid = env.tgid;
 	obj->rodata->budget_ns = env.budget_us * 1000;
+	obj->rodata->budget_mode = env.budget_mode;
+	obj->rodata->median_factor_pct = (__u32)(env.median_factor * 100.0 + 0.5);
+	obj->rodata->min_budget_ns = env.min_budget_us * 1000;
+	obj->rodata->gate_share_pct = (__u32)(env.share * 100.0 + 0.5);
 	obj->rodata->min_stall_ns = env.min_stall_us * 1000;
 	obj->rodata->max_hops = env.hops;
 	obj->rodata->kernel_stacks = true;
@@ -1467,19 +1542,32 @@ int main(int argc, char **argv)
 	 * present time once we tell it the probe is there.
 	 */
 	if (env.present_marker && env.present_marker[0]) {
+		/*
+		 * A real present is one function: entry opens the frame, return
+		 * closes the present. "ret:" (optionally "ret:SYMBOL") asks for
+		 * a uretprobe rather than a second entry probe.
+		 */
+		const char *pm = env.present_marker;
+		bool retprobe = !strncmp(pm, "ret:", 4);
+		const char *psym = retprobe ? (pm[4] ? pm + 4 : env.marker) : pm;
 		LIBBPF_OPTS(bpf_uprobe_opts, popts,
-			    .retprobe = false,
-			    .func_name = env.present_marker);
+			    .retprobe = retprobe,
+			    .func_name = psym);
 
 		present_link = bpf_program__attach_uprobe_opts(obj->progs.on_present_end,
 							       env.tgid, binary, 0,
 							       &popts);
 		if (present_link) {
 			obj->bss->have_present_marker = true;
+			if (env.verbose)
+				fprintf(stderr, "present bracket: %s %s() in %s\n",
+					retprobe ? "return of" : "entry of",
+					psym, binary);
 		} else if (!env.quiet) {
-			fprintf(stderr, "note: %s() not found in %s; time inside "
-				"present will be named by what it blocked in "
-				"instead\n", env.present_marker, binary);
+			fprintf(stderr, "note: cannot probe %s%s() in %s; time "
+				"inside present will be named by what it blocked "
+				"in instead\n", retprobe ? "the return of " : "",
+				psym, binary);
 		}
 	}
 

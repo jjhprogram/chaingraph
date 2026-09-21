@@ -32,7 +32,7 @@ Q = @
 msg = @printf '  %-8s %s\n' "$(1)" "$(2)";
 endif
 
-.PHONY: all clean test test-hitch
+.PHONY: all clean test test-hitch layer layer-install
 all: $(addprefix $(OUTPUT)/,$(APPS) $(BENCHES))
 
 $(OUTPUT) $(OUTPUT)/libbpf:
@@ -75,6 +75,26 @@ $(OUTPUT)/syms.o: src/syms.c src/syms.h | $(OUTPUT)
 $(addprefix $(OUTPUT)/,$(APPS)): $(OUTPUT)/%: $(OUTPUT)/%.o $(OUTPUT)/syms.o $(LIBBPF_OBJ)
 	$(call msg,BINARY,$@)
 	$(Q)$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+# the implicit Vulkan layer: gives any Vulkan app the frame markers.
+# The two markers carry visibility("default") so they stay in .dynsym and
+# .symtab for the uprobe; never strip this .so.
+LAYER_SO  := $(OUTPUT)/libVkLayer_hitchtrace.so
+LAYER_DIR ?= $(HOME)/.local/share/vulkan/implicit_layer.d
+
+$(LAYER_SO): layer/hitchtrace_layer.c | $(OUTPUT)
+	$(call msg,LAYER,$@)
+	$(Q)$(CC) -g -O2 -Wall -Wextra -fPIC -fvisibility=hidden -shared \
+		-pthread $< -o $@ -Wl,-z,defs
+
+layer: $(LAYER_SO)
+
+# install the manifest for this user, pointing at the built .so
+layer-install: $(LAYER_SO) layer/VkLayer_hitchtrace.json
+	$(call msg,INSTALL,$(LAYER_DIR)/VkLayer_hitchtrace.json)
+	$(Q)mkdir -p $(LAYER_DIR)
+	$(Q)sed 's#"library_path": "[^"]*"#"library_path": "$(abspath $(LAYER_SO))"#' \
+		layer/VkLayer_hitchtrace.json > $(LAYER_DIR)/VkLayer_hitchtrace.json
 
 # synthetic workloads used by the test scripts
 $(OUTPUT)/chainload: tests/chainload.c | $(OUTPUT)

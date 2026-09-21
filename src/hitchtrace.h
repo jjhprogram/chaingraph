@@ -24,7 +24,13 @@
 #define TASK_COMM_LEN		16
 #define HT_MAX_HOPS		5	/* chain hops kept for the worst stall */
 #define HT_PERF_MAX_STACK	32	/* frames per kernel stack */
-#define HT_MAX_THREADS		16	/* per-thread detail slots in a record */
+#define HT_MAX_THREADS		32	/* per-thread detail slots in a record */
+#define HT_MEDIAN_WINDOW	19	/* frames behind the rolling-median budget */
+#define HT_MEDIAN_MIN		8	/* ... before that budget is trusted */
+
+/* --budget-mode */
+#define HT_BUDGET_FIXED		0
+#define HT_BUDGET_MEDIAN	1
 
 /*
  * Root-timeline buckets. HT_ONCPU..HT_BLOCK_OTHER partition the frame;
@@ -141,6 +147,7 @@ struct ht_record {
 	char root_comm[TASK_COMM_LEN];
 	__u32 nstalls;		/* blocked/runnable intervals in this frame */
 	__u32 flags;		/* HT_FRAME_* */
+	__u64 stall_ns;		/* the part of the frame the gate weighed */
 	__u32 nthreads;		/* valid entries in threads[] */
 	__u32 __pad;
 	struct ht_thread threads[HT_MAX_THREADS];

@@ -54,6 +54,10 @@
 /* Configuration, set by userspace before load (lands in .rodata). */
 const volatile __u32 targ_tgid = 0;
 const volatile __u64 budget_ns = 16667000;
+const volatile __u32 budget_mode = HT_BUDGET_FIXED;
+const volatile __u32 median_factor_pct = 150;	/* budget = median x this */
+const volatile __u64 min_budget_ns = 2000000;	/* floor for the median mode */
+const volatile __u32 gate_share_pct;		/* 0: gate on the symptom alone */
 const volatile __u64 min_stall_ns = 100000;
 const volatile __u32 max_hops = HT_MAX_HOPS;
 const volatile bool kernel_stacks = true;
@@ -109,6 +113,9 @@ struct task_state {
 	__u64 snap_fault_major;
 	__u64 snap_reclaim;
 	__u64 snap_compact;
+	__u64 hist[HT_MEDIAN_WINDOW];	/* recent frame times, for the median */
+	__u32 hist_n;
+	__u32 hist_i;
 	__u32 preempt_pid;	/* who took the CPU at the last preemption */
 	__u32 preempt_tgid;
 	char preempt_comm[TASK_COMM_LEN];
@@ -290,6 +297,35 @@ int BPF_PROG(on_irq_exit_leave)
 
 	if (n && *n)
 		(*n)--;
+	return 0;
+}
+
+/*
+ * Median of the recent frame times, for an app with no fixed cap. A counting
+ * select rather than a sort: the window is small, and two bounded loops are
+ * easier on the verifier than swapping elements around.
+ */
+static __always_inline __u64 median_frame(struct task_state *ts)
+{
+	__u32 i, j, n = ts->hist_n, target, cnt;
+
+	if (n > HT_MEDIAN_WINDOW)
+		n = HT_MEDIAN_WINDOW;
+	target = n / 2;
+	for (i = 0; i < HT_MEDIAN_WINDOW; i++) {
+		if (i >= n)
+			break;
+		cnt = 0;
+		for (j = 0; j < HT_MEDIAN_WINDOW; j++) {
+			if (j >= n)
+				break;
+			if (ts->hist[j] < ts->hist[i] ||
+			    (ts->hist[j] == ts->hist[i] && j < i))
+				cnt++;
+		}
+		if (cnt == target)
+			return ts->hist[i];
+	}
 	return 0;
 }
 
@@ -1011,7 +1047,9 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 	struct frame_ctx *fc = frame_ctx();
 	struct task_state *ts;
 	struct ht_record *rec;
-	__u32 i, nthreads = 0;
+	__u64 eff_budget, stall_ns;
+	__u32 i;
+	bool over;
 
 	if (!in_target(cur))
 		return 0;
@@ -1036,7 +1074,47 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 		frame_ns = now - ts->frame_start;
 		stat_inc(HT_STAT_FRAMES);
 
-		if (frame_ns > budget_ns) {
+		eff_budget = budget_ns;
+		if (budget_mode == HT_BUDGET_MEDIAN && ts->hist_n >= HT_MEDIAN_MIN) {
+			__u64 med = median_frame(ts);
+
+			if (med) {
+				eff_budget = med * median_factor_pct / 100;
+				if (eff_budget < min_budget_ns)
+					eff_budget = min_budget_ns;
+			}
+		}
+
+		/*
+		 * What the gate weighs: everything on the root's timeline that
+		 * was neither the app running nor the display holding it back.
+		 */
+		stall_ns = 0;
+		for (i = 0; i < HT_CAUSE_PARTITION; i++) {
+			if (i == HT_ONCPU || i == HT_BLOCK_PRESENT)
+				continue;
+			stall_ns += ts->cause_ns[i];
+		}
+
+		over = frame_ns > eff_budget;
+		if (over && gate_share_pct) {
+			__u64 excess = frame_ns - eff_budget;
+
+			/* over budget is not enough: the excess has to be
+			 * kernel-observable to the share the caller asked for */
+			if (stall_ns * 100 < (__u64)gate_share_pct * excess)
+				over = false;
+		}
+
+		/* the window later frames are judged against */
+		if (ts->hist_i >= HT_MEDIAN_WINDOW)
+			ts->hist_i = 0;
+		ts->hist[ts->hist_i] = frame_ns;
+		ts->hist_i = (ts->hist_i + 1) % HT_MEDIAN_WINDOW;
+		if (ts->hist_n < HT_MEDIAN_WINDOW)
+			ts->hist_n++;
+
+		if (over) {
 			stat_inc(HT_STAT_HITCHES);
 			rec = bpf_ringbuf_reserve(&events, sizeof(*rec), 0);
 			if (!rec) {
@@ -1046,7 +1124,8 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 				rec->frame_start_ns = ts->frame_start;
 				rec->frame_end_ns = now;
 				rec->frame_ns = frame_ns;
-				rec->budget_ns = budget_ns;
+				rec->budget_ns = eff_budget;
+				rec->stall_ns = stall_ns;
 				__builtin_memcpy(rec->cause_ns, ts->cause_ns,
 						 sizeof(rec->cause_ns));
 				__builtin_memcpy(&rec->worst, &ts->worst,
@@ -1064,39 +1143,24 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 				 * thread still off-CPU now never got to close
 				 * its last interval, so do it here.
 				 */
-				for (i = 0; i < HT_MAX_THREADS; i++) {
+				/*
+				 * The root's own slot is finished here, outside
+				 * the walk: doing it inside would put four more
+				 * branches in a loop the verifier unrolls, and
+				 * that alone blows the complexity limit.
+				 */
+				i = ts->slot1 ? ts->slot1 - 1 : HT_MAX_THREADS;
+				if (i < HT_MAX_THREADS) {
 					struct thread_slot *sl =
 						bpf_map_lookup_elem(&thread_slots, &i);
 
-					if (!sl || !fc || !sl->th.pid)
-						continue;
-					if (sl->epoch != fc->epoch) {
-						/* never scheduled this frame: only
-						 * interesting if it is still blocked */
-						if (!sl->out_ts)
-							continue;
-						__builtin_memset(sl->th.cause_ns, 0,
-								 sizeof(sl->th.cause_ns));
-						sl->th.largest_ns = 0;
-						sl->th.preemptor_ns = 0;
-						sl->th.open_ns = 0;
-						sl->th.flags = 0;
-						sl->epoch = fc->epoch;
-					}
-					if (sl->out_ts) {
-						sl->th.open_ns =
-							clip(sl->out_ts, now,
-							     ts->frame_start);
-						sl->th.flags |= HT_THREAD_BLOCKED_END;
-						rec->flags |= HT_FRAME_OPEN_STALL;
-					}
-					if (sl->th.pid == (__u32)cur->pid) {
+					if (sl && fc && sl->epoch == fc->epoch) {
 						sl->th.flags |= HT_THREAD_ROOT;
 						if (ts->in_ts)
 							sl->th.cause_ns[HT_ONCPU] +=
 								clip(ts->in_ts, now,
 								     ts->frame_start);
-						/* same split the record just got */
+						/* the split the record just got */
 						carve(sl->th.cause_ns,
 						      HT_ONCPU_FAULT_MAJOR,
 						      ts->fault_major_ns -
@@ -1108,14 +1172,55 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 						carve(sl->th.cause_ns, HT_ONCPU_COMPACT,
 						      ts->compact_ns - sl->snap_compact);
 					}
-					if (nthreads < HT_MAX_THREADS) {
-						__builtin_memcpy(&rec->threads[nthreads],
-								 &sl->th,
-								 sizeof(struct ht_thread));
-						nthreads++;
+				}
+
+				/*
+				 * Each thread lands in ITS OWN slot index, not at
+				 * a running counter: a counter differs on every
+				 * path through the unrolled walk, so the verifier
+				 * cannot prune states and the program stops
+				 * verifying. Unused slots are zeroed here and
+				 * come through with pid 0; the front end skips
+				 * them.
+				 */
+				for (i = 0; i < HT_MAX_THREADS; i++) {
+					struct thread_slot *sl =
+						bpf_map_lookup_elem(&thread_slots, &i);
+					struct ht_thread *t = &rec->threads[i];
+					bool fresh, use = false;
+
+					if (sl && fc) {
+						fresh = sl->epoch == fc->epoch;
+						/* a thread that never ran this
+						 * frame is only interesting if
+						 * it is still blocked */
+						use = sl->th.pid &&
+						      (fresh || sl->out_ts);
+					} else {
+						fresh = false;
+					}
+					if (!use || !sl) {
+						__builtin_memset(t, 0, sizeof(*t));
+						continue;
+					}
+					if (sl->out_ts) {
+						sl->th.open_ns =
+							clip(sl->out_ts, now,
+							     ts->frame_start);
+						sl->th.flags |= HT_THREAD_BLOCKED_END;
+						rec->flags |= HT_FRAME_OPEN_STALL;
+					}
+					__builtin_memcpy(t, &sl->th, sizeof(*t));
+					if (!fresh) {
+						/* its buckets belong to an older
+						 * frame; only the open wait counts */
+						__builtin_memset(t->cause_ns, 0,
+								 sizeof(t->cause_ns));
+						t->largest_ns = 0;
+						t->preemptor_ns = 0;
 					}
 				}
-				rec->nthreads = nthreads;
+				rec->nthreads = HT_MAX_THREADS;
 				rec->__pad = 0;
 				/* more threads ran than there are slots */
 				i = 0;
