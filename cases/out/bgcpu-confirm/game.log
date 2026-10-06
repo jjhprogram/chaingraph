@@ -1,0 +1,2 @@
+minigame pid=6492 640x360 workers=3 tiles=24 objects=120 cap=60 fps duration=64 s
+minigame: 3827 frames
