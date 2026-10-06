@@ -10,9 +10,9 @@
  *	oncpu + runnable + runqueue + Σ(blocked buckets) == frame_ns
  *
  * holds on the root. Blocked time is then resolved through the wake chain:
- * the part of a wait that overlaps the waker's own stall is inherited from
- * the waker, and the rest is the waker running on-CPU ("waiting for work",
- * not a kernel stall).
+ * however long the waker was itself off-CPU while it was being waited for is
+ * inherited from the waker, and the rest is the waker running on-CPU
+ * ("waiting for work", not a kernel stall).
  *
  * Records cross to user space only for frames over budget.
  *
@@ -76,7 +76,8 @@ enum ht_sysclass {
 #define HT_HOP_IDLE	(1U << 3)	/* waker was an idle task */
 #define HT_HOP_ONCPU	(1U << 4)	/* waker was running, not stalled */
 #define HT_HOP_TRUNC	(1U << 5)	/* chain continues beyond HT_MAX_HOPS */
-#define HT_HOP_STALE	(1U << 6)	/* waker's stall ended before this wait began */
+#define HT_HOP_STALE	(1U << 6)	/* waker's own wait ended before this wait began */
+#define HT_HOP_HIST	(1U << 7)	/* waker's history is shorter than the wait: ns is a lower bound */
 
 #define HT_FRAME_OPEN_STALL	(1U << 0)	/* a stall was still open at frame end */
 #define HT_FRAME_NO_ROOT_STATE	(1U << 1)	/* root state was created mid-frame */
@@ -95,11 +96,15 @@ struct ht_hop {
 	__u32 pid;
 	__u32 tgid;
 	char comm[TASK_COMM_LEN];
-	__u64 ns;		/* of the waited time this hop explains */
-	__u32 cause;		/* enum ht_cause: what the waker was doing */
+	__u64 ns;		/* how long this task was off-CPU while waited for */
+	__u64 sched_ns;		/* ... of which runnable: preempted or queued */
+	__u32 cause;		/* enum ht_cause: what mostly kept it off-CPU */
 	__u32 flags;		/* HT_HOP_* */
-	__s32 kstack_id;	/* where the waker was blocked, if it was */
+	__s32 kstack_id;	/* where it last blocked, if blocking dominates */
+	__u32 preempt_pid;	/* who last preempted it during the wait, if anyone */
+	__u32 preempt_tgid;
 	__u32 __pad;
+	char preempt_comm[TASK_COMM_LEN];
 };
 
 /* The worst single blocked interval of the frame, and its chain. */

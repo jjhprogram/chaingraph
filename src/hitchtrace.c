@@ -328,7 +328,7 @@ static const char *short_name(__u32 cause)
 
 /* bit position -> name, for the JSON flag lists */
 static const char *const hop_flag_names[] = {
-	"irq", "softirq", "irqexit", "idle", "oncpu", "trunc", "stale",
+	"irq", "softirq", "irqexit", "idle", "oncpu", "trunc", "stale", "hist",
 };
 static const char *const frame_flag_names[] = {
 	"open_stall", "no_root_state", "lost", "threads_full",
@@ -612,12 +612,40 @@ static void hop_desc(char *buf, size_t sz, const struct ht_hop *h)
 		snprintf(buf, sz, "was idle%s", stale);
 		return;
 	}
+	/* the waker's history was shorter than the wait it is asked about */
+	if (h->flags & HT_HOP_HIST)
+		stale = " [at least]";
+	if (h->cause == HT_RUNNABLE) {
+		/* it lost the CPU: say to whom, which is the cause */
+		size_t len = 0;
+
+		append(buf, sz, &len, "kept off the CPU %.1f ms", ms(h->ns));
+		if (h->preempt_pid) {
+			char who[TASK_COMM_LEN + 24];
+
+			task_label(who, sizeof(who), h->preempt_comm, h->preempt_pid);
+			append(buf, sz, &len, ", last preempted by %s", who);
+		}
+		if (h->ns > h->sched_ns)
+			append(buf, sz, &len, " (%.1f ms of it blocked)",
+			       ms(h->ns - h->sched_ns));
+		append(buf, sz, &len, "%s", stale);
+		return;
+	}
 	where = blocked_in(h->kstack_id);
 	if (where)
-		snprintf(buf, sz, "blocked %.1f ms in %s%s", ms(h->ns), where, stale);
+		snprintf(buf, sz, "blocked %.1f ms in %s", ms(h->ns), where);
 	else
-		snprintf(buf, sz, "%s %.1f ms%s", cause_phrase(h->cause), ms(h->ns),
-			 stale);
+		snprintf(buf, sz, "%s %.1f ms", cause_phrase(h->cause), ms(h->ns));
+	{
+		size_t len = strlen(buf);
+
+		/* worth a mention once it is a tenth of the time */
+		if (h->sched_ns * 10 >= h->ns && h->sched_ns)
+			append(buf, sz, &len, " (%.1f ms of it kept off the CPU)",
+			       ms(h->sched_ns));
+		append(buf, sz, &len, "%s", stale);
+	}
 }
 
 /* description column of the chain, so nested hops stay aligned */
@@ -1010,7 +1038,8 @@ static void json_hop(FILE *f, const struct ht_hop *h)
 	/* pid is the thread id and tgid the process, as in the kernel */
 	fprintf(f, "{\"pid\":%u,\"tgid\":%u,\"comm\":", h->pid, h->tgid);
 	json_comm(f, h->comm);
-	fprintf(f, ",\"ns\":%llu,\"cause\":", (unsigned long long)h->ns);
+	fprintf(f, ",\"ns\":%llu,\"sched_ns\":%llu,\"cause\":",
+		(unsigned long long)h->ns, (unsigned long long)h->sched_ns);
 	json_str(f, h->cause < HT_CAUSE_MAX ? cause_names[h->cause] : "unknown");
 	fprintf(f, ",\"flags\":");
 	json_flags(f, h->flags, hop_flag_names,
@@ -1021,6 +1050,16 @@ static void json_hop(FILE *f, const struct ht_hop *h)
 		json_str(f, where);
 	else
 		fprintf(f, "null");
+	/* who last took its CPU while it was being waited for */
+	fprintf(f, ",\"preemptor\":");
+	if (h->preempt_pid) {
+		fprintf(f, "{\"tid\":%u,\"tgid\":%u,\"comm\":", h->preempt_pid,
+			h->preempt_tgid);
+		json_comm(f, h->preempt_comm);
+		fputc('}', f);
+	} else {
+		fprintf(f, "null");
+	}
 	fputc('}', f);
 }
 

@@ -7,12 +7,13 @@
  * is timed, clipped to the frame window and added to one bucket, so
  * oncpu + runnable + runqueue + blocked == frame_ns on the root.
  *
- * Blocked time is resolved through the wake chain. Every task carries, in
- * task storage, a snapshot of its waker's most recent off-CPU interval, taken
- * when the wakeup happened (links[0]), plus the waker's own chain shifted down
- * (links[1..]). The part of a wait that overlaps the waker's stall is
- * inherited from it; the rest is the waker running on-CPU, i.e. waiting for
- * work rather than a kernel stall.
+ * Blocked time is resolved through the wake chain. Every task keeps a short
+ * history of its own off-CPU time, and carries, in task storage, a record of
+ * its latest wakeup (links[0]): who the waker was and how long the waker had
+ * itself been off-CPU -- preempted, queued or blocked -- since this task began
+ * to wait, plus the waker's own chain shifted down (links[1..]). That time is
+ * inherited from the waker; the rest of the wait is the waker running on-CPU,
+ * i.e. waiting for work rather than a kernel stall.
  *
  * A record crosses to user space only when frame_ns > budget_ns.
  */
@@ -69,18 +70,51 @@ const volatile bool kernel_stacks = true;
 bool have_present_marker = false;
 const volatile bool user_stacks = false;
 
-/* What we knew about a waker when it issued the wakeup. */
+/*
+ * What we knew about a waker when it issued the wakeup: how long it had itself
+ * been off-CPU while the wakee was waiting for it, [since, wake_ts).
+ */
 struct hop_link {
 	__u64 wake_ts;		/* when this wakeup happened */
-	__u64 w_out;		/* waker's last off-CPU interval ... */
-	__u64 w_in;		/* ... as of that moment */
-	__u32 w_cause;		/* enum ht_cause of that interval */
-	__s32 w_kstack;		/* where the waker was blocked, if it was */
+	__u64 since;		/* when the wakee began to wait */
+	__u64 sched_ns;		/* waker runnable (preempted, queued) in between */
+	__u64 blocked_ns;	/* waker blocked in between */
+	__u32 w_cause;		/* enum ht_cause of the waker's last blocked interval */
+	__s32 w_kstack;		/* ... and where it blocked */
 	__u32 pid;
 	__u32 tgid;
 	__u32 flags;		/* HT_HOP_* */
+	__u32 p_pid;		/* who last preempted the waker in between; 0 if nobody */
+	__u32 p_tgid;
 	__u32 __pad;
 	char comm[TASK_COMM_LEN];
+	char p_comm[TASK_COMM_LEN];
+};
+
+/*
+ * A task's off-CPU history, so that a waker can say how long it was off-CPU
+ * over somebody else's wait rather than only over its own last interval: a
+ * preempted worker loses the CPU several times a frame, and a read split into
+ * many short waits blocks a hundred times.
+ *
+ * Each checkpoint is the task's cumulative off-CPU time just before one
+ * interval began. Intervals that end within HT_CKPT_GRAIN_NS of a checkpoint
+ * share it instead of opening their own, so the ring always reaches back at
+ * least HT_CKPT x HT_CKPT_GRAIN_NS however finely the time is chopped up; the
+ * price is that a wait which starts among such merged intervals misses up to
+ * one grain of them.
+ */
+#define HT_CKPT			32	/* power of two */
+#define HT_CKPT_GRAIN_NS	2000000ULL
+
+struct stall_ckpt {
+	__u64 ts;		/* when the opening interval ended; 0 = unused */
+	__u64 first_out;	/* the opening interval: off-CPU from here ... */
+	__u64 first_hi;		/* ... woken (or back on-CPU) here, then queued to ts */
+	__u64 sched_before;	/* cum_sched / cum_blocked before that interval */
+	__u64 blocked_before;
+	__u32 first_blocked;	/* [first_out, first_hi) was blocked, not preempted */
+	__u32 __pad;
 };
 
 struct task_state {
@@ -92,10 +126,11 @@ struct task_state {
 	__u32 out_iowait;	/* in_iowait at switch-out */
 	__s32 out_kstack;	/* stacks captured at switch-out */
 	__s32 out_ustack;
-	__u64 last_out;		/* last completed off-CPU interval ... */
-	__u64 last_in;
-	__u32 last_cause;	/* ... and what it was */
-	__s32 last_kstack;
+	__u64 cum_sched;	/* off-CPU so far: runnable (preempted, queued) */
+	__u64 cum_blocked;	/* ... and blocked */
+	__u32 block_cause;	/* the last blocked interval: what it was ... */
+	__s32 block_kstack;	/* ... and where */
+	__u32 ckpt_head;	/* newest entry of ckpt[] */
 	__u32 depth;		/* valid entries in links[] */
 	__u32 seq;		/* odd while links[] is being rewritten */
 	__u32 slot1;		/* per-thread record slot, 1-based; 0 = none */
@@ -119,7 +154,9 @@ struct task_state {
 	__u32 preempt_pid;	/* who took the CPU at the last preemption */
 	__u32 preempt_tgid;
 	char preempt_comm[TASK_COMM_LEN];
+	__u64 preempt_ts;	/* ... and when */
 	struct hop_link links[HT_MAX_HOPS];
+	struct stall_ckpt ckpt[HT_CKPT];
 
 	/* frame accounting, used only by a root thread */
 	bool is_root;
@@ -355,6 +392,84 @@ static __always_inline void add_cause(struct task_state *ts, __u32 cause, __u64 
 	ts->cause_ns[cause] += ns;
 }
 
+/* Account one finished off-CPU interval of @ts: [lo, hi) then queued to @now. */
+static __always_inline void ckpt_push(struct task_state *ts, __u64 lo, __u64 hi,
+				      __u64 now, bool blocked)
+{
+	__u32 head = ts->ckpt_head & (HT_CKPT - 1);
+	struct stall_ckpt *c = &ts->ckpt[head];
+
+	if (!c->ts || now - c->ts >= HT_CKPT_GRAIN_NS) {
+		head = (head + 1) & (HT_CKPT - 1);
+		c = &ts->ckpt[head];
+		ts->ckpt_head = head;
+		c->ts = now;
+		c->first_out = lo;
+		c->first_hi = hi;
+		c->sched_before = ts->cum_sched;
+		c->blocked_before = ts->cum_blocked;
+		c->first_blocked = blocked;
+	}
+	if (blocked)
+		ts->cum_blocked += hi - lo;
+	else
+		ts->cum_sched += hi - lo;
+	ts->cum_sched += now - hi;
+}
+
+/*
+ * How long @w was off-CPU in [since, now), split into runnable and blocked.
+ * @w must be the current task: its history is then not being written.
+ * Returns HT_HOP_HIST if the history does not reach back to @since, in which
+ * case the answer covers only what it does reach.
+ */
+static __always_inline __u32 stall_since(struct task_state *w, __u64 since,
+					 __u64 now, __u64 *sched, __u64 *blocked)
+{
+	/* nothing newer than the newest checkpoint: the base is "now" */
+	__u64 base_s = w->cum_sched, base_b = w->cum_blocked, s, b, span;
+	__u32 head = w->ckpt_head, i, short_hist = HT_HOP_HIST;
+
+	for (i = 0; i < HT_CKPT; i++) {
+		struct stall_ckpt *c = &w->ckpt[(head - i) & (HT_CKPT - 1)];
+
+		if (!c->ts) {			/* the history starts here */
+			short_hist = 0;
+			break;
+		}
+		if (c->first_out >= since) {	/* wholly inside the window */
+			base_s = c->sched_before;
+			base_b = c->blocked_before;
+			continue;
+		}
+		short_hist = 0;
+		if (since < c->ts) {		/* the window opens inside it */
+			__u64 cut = since < c->first_hi ? since : c->first_hi;
+
+			base_s = c->sched_before;
+			base_b = c->blocked_before;
+			if (c->first_blocked)
+				base_b += cut - c->first_out;
+			else
+				base_s += cut - c->first_out;
+			base_s += since - cut;
+		}
+		break;
+	}
+
+	s = w->cum_sched - base_s;
+	b = w->cum_blocked - base_b;
+	/* a task is off-CPU for at most the whole window */
+	span = now > since ? now - since : 0;
+	if (s > span)
+		s = span;
+	if (b > span - s)
+		b = span - s;
+	*sched = s;
+	*blocked = b;
+	return short_hist;
+}
+
 static __always_inline __s32 kernel_stack(void *ctx)
 {
 	long id;
@@ -468,6 +583,7 @@ static __always_inline int record_wakeup(void *ctx, struct task_struct *p)
 	struct task_state *ts, *wts = NULL;
 	struct hop_link *l;
 	__u32 flags = 0, depth = 1;
+	__u64 now, since;
 	bool interrupt;
 	int pc;
 
@@ -498,7 +614,7 @@ static __always_inline int record_wakeup(void *ctx, struct task_struct *p)
 
 	/* In interrupt context "current" is only the interrupted task. */
 	interrupt = flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE);
-	if (!interrupt && max_hops > 1)
+	if (!interrupt)
 		wts = bpf_task_storage_get(&task_states, waker, NULL, 0);
 
 	ts->seq++;
@@ -527,28 +643,42 @@ static __always_inline int record_wakeup(void *ctx, struct task_struct *p)
 				 sizeof(struct hop_link) * (HT_MAX_HOPS - 1));
 	}
 
+	/*
+	 * The wait this wakeup ends began when @p left the CPU; if it has not
+	 * left yet (woken between setting its state and schedule()) there is
+	 * no wait to explain. A root only answers for the frame that is open.
+	 */
+	now = bpf_ktime_get_ns();
+	since = ts->out_ts ? ts->out_ts : now;
+	if (ts->is_root && ts->frame_start > since)
+		since = ts->frame_start;
+
 	l = &ts->links[0];
 	__builtin_memset(l, 0, sizeof(*l));
-	l->wake_ts = bpf_ktime_get_ns();
+	l->wake_ts = now;
+	l->since = since;
 	l->flags = flags;
+	l->w_kstack = -1;
 	if (!interrupt) {
 		l->pid = waker->pid;
 		l->tgid = waker->tgid;
 		bpf_get_current_comm(l->comm, sizeof(l->comm));
 		if (wts) {
-			l->w_out = wts->last_out;
-			l->w_in = wts->last_in;
-			l->w_cause = wts->last_cause;
-			l->w_kstack = wts->last_kstack;
-		} else {
-			l->w_kstack = -1;
+			l->flags |= stall_since(wts, since, now, &l->sched_ns,
+						&l->blocked_ns);
+			l->w_cause = wts->block_cause;
+			l->w_kstack = wts->block_kstack;
+			if (wts->preempt_ts >= since && wts->preempt_pid) {
+				l->p_pid = wts->preempt_pid;
+				l->p_tgid = wts->preempt_tgid;
+				__builtin_memcpy(l->p_comm, wts->preempt_comm,
+						 TASK_COMM_LEN);
+			}
 		}
-	} else {
-		l->w_kstack = -1;
 	}
 	ts->depth = depth;
 	ts->seq++;
-	ts->wake_ts = l->wake_ts;
+	ts->wake_ts = now;
 	return 0;
 }
 
@@ -818,15 +948,18 @@ static __always_inline void resolve(struct task_state *ts, __u64 lo, __u64 hi,
 				    __u32 cause, __u64 blocked_ns, bool resolvable)
 {
 	struct ht_stall *w = &ts->worst;
-	__u64 prev_out = lo, prev_in = hi, inherited = 0;
+	__u64 win_lo = lo, win_hi = hi, inherited;
 	__u32 i, nhops = 0;
 
 	/*
-	 * links[0] is the waker; how much of the wait does its own stall cover?
-	 * Only a wait ended by another task splits this way: an I/O or timer
-	 * wait was not spent waiting for a thread to get around to us.
+	 * links[0] is the waker; how long was it off-CPU itself while we
+	 * waited for it? Only a wait ended by another task splits this way:
+	 * an I/O or timer wait was not spent waiting for a thread to get
+	 * around to us.
 	 */
-	inherited = overlap(lo, hi, ts->links[0].w_out, ts->links[0].w_in);
+	inherited = ts->links[0].sched_ns + ts->links[0].blocked_ns;
+	if (inherited > blocked_ns)
+		inherited = blocked_ns;
 	if (ts->links[0].flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE))
 		inherited = 0;
 	if (resolvable) {
@@ -849,38 +982,72 @@ static __always_inline void resolve(struct task_state *ts, __u64 lo, __u64 hi,
 	for (i = 0; i < HT_MAX_HOPS; i++) {
 		struct hop_link *l = &ts->links[i];
 		struct ht_hop *h = &w->hops[i];
-		__u64 ns;
+		__u64 span, sched, ns;
+		bool irq, running, preempted;
 
 		if (i >= max_hops || i >= ts->depth)
 			break;
 		if (!l->flags && !l->pid)
 			break;
 
-		ns = overlap(prev_out, prev_in, l->w_out, l->w_in);
-		if (l->flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE))
-			ns = 0;
+		/*
+		 * The link covers the wait [since, wake_ts) of the task one
+		 * hop up; only the part of it inside the wait still being
+		 * explained counts here.
+		 */
+		irq = l->flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE);
+		span = overlap(win_lo, win_hi, l->since, l->wake_ts);
+		sched = l->sched_ns;
+		ns = sched + l->blocked_ns;
+		if (irq)
+			sched = ns = 0;
+		if (ns > span)
+			ns = span;
+		if (sched > ns)
+			sched = ns;
+		/*
+		 * Too little to be a stall (the moment a freshly woken waker
+		 * spends queued, typically): it was running.
+		 */
+		running = ns < min_stall_ns;
+		/* mostly kept off the CPU rather than blocked */
+		preempted = !running && sched * 2 >= ns;
 
 		h->pid = l->pid;
 		h->tgid = l->tgid;
 		__builtin_memcpy(h->comm, l->comm, TASK_COMM_LEN);
 		h->ns = ns;
-		h->cause = l->w_cause;
-		h->kstack_id = l->w_kstack;
+		h->sched_ns = sched;
+		h->cause = preempted ? HT_RUNNABLE : l->w_cause;
+		h->kstack_id = preempted ? -1 : l->w_kstack;
 		h->flags = l->flags;
-		if (!ns)
+		if (sched && !running) {
+			h->preempt_pid = l->p_pid;
+			h->preempt_tgid = l->p_tgid;
+			__builtin_memcpy(h->preempt_comm, l->p_comm, TASK_COMM_LEN);
+		}
+		if (running)
 			h->flags |= HT_HOP_ONCPU;
-		if (l->w_in && l->w_in < prev_out)
+		if (i && !span)
 			h->flags |= HT_HOP_STALE;
 		nhops = i + 1;
 
 		/* an interrupt ends the chain */
-		if (l->flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE))
+		if (irq)
 			break;
 		/* nothing left to explain: the waker was running */
-		if (!ns)
+		if (running)
 			break;
-		prev_out = l->w_out;
-		prev_in = l->w_in;
+		/*
+		 * It lost the CPU: the cause is whoever took it, and the task
+		 * that last woke this one has nothing to do with that.
+		 */
+		if (preempted)
+			break;
+		if (l->since > win_lo)
+			win_lo = l->since;
+		if (l->wake_ts < win_hi)
+			win_hi = l->wake_ts;
 	}
 	w->nhops = nhops;
 }
@@ -937,13 +1104,18 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
 						sl->out_ts = now;
 					}
 				}
-				/* who took the CPU, for the runnable bucket */
-				if (preempt || prev_state == TASK_RUNNING) {
-					ts->preempt_pid = next->pid;
-					ts->preempt_tgid = next->tgid;
-					__builtin_memcpy(ts->preempt_comm,
-							 next->comm, TASK_COMM_LEN);
-				}
+			}
+			/*
+			 * Who took the CPU: for the runnable bucket, and for
+			 * whoever this task keeps waiting meanwhile -- so for
+			 * every task, not only the target's.
+			 */
+			if (preempt || prev_state == TASK_RUNNING) {
+				ts->preempt_pid = next->pid;
+				ts->preempt_tgid = next->tgid;
+				ts->preempt_ts = now;
+				__builtin_memcpy(ts->preempt_comm, next->comm,
+						 TASK_COMM_LEN);
 			}
 			ts->out_ts = now;
 			ts->out_state = preempt ? TASK_RUNNING : prev_state;
@@ -980,11 +1152,12 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
 	}
 	resolvable = cause != HT_RUNNABLE && woken && !irq_waker;
 
-	/* hand this interval to whoever this task wakes next */
-	ts->last_out = lo;
-	ts->last_in = now;
-	ts->last_cause = cause;
-	ts->last_kstack = ts->out_kstack;
+	/* into the history that whoever this task wakes next will ask about */
+	if (cause != HT_RUNNABLE) {
+		ts->block_cause = cause;
+		ts->block_kstack = ts->out_kstack;
+	}
+	ckpt_push(ts, lo, hi, now, cause != HT_RUNNABLE);
 
 	if (track_next) {
 		struct frame_ctx *fc = frame_ctx();
