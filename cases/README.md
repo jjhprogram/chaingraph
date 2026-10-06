@@ -11,6 +11,7 @@ around one unmodified workload, and asks whether a hitchtrace record alone expla
   (`frames.jsonl`), which is what an engine's built-in profiler would show.
 - **The environment** supplies the cause. `bgload.c` is a background application that wakes
   periodically and burns CPU. It logs every burst, and that log is the ground truth.
+  `bgio.c` is its disk counterpart (not used in a case yet; see case 2).
 - **`run.sh VARIANT [SECONDS] [RUN_NAME]`** runs the game on CPUs 0–3, attaches hitchtrace through the
   Vulkan layer, and writes everything to `out/RUN_NAME/`.
 
@@ -202,3 +203,112 @@ hitch frame 3119  28.9 ms  (budget 20.8 ms, over by 8.1 ms)  root mg_main
 frames was `llvmpipe-N`: threads of another process doing software rendering, most likely the desktop
 compositor. hitchtrace prints the preempting thread's name but not its process, although the record
 carries the process id.
+
+## Case 2: a frame waits on storage (`iomain`, `iothread`)
+
+**What it models.** `cases.md` category C and the "synchronous asset read" example: every 30th frame
+the game needs an 8 MB asset from a pack file before it can draw, as at an area transition. Two
+variants, the two ways games end up waiting on storage:
+
+- **`iomain`**: the main thread reads the asset itself, 1 MB at a time.
+- **`iothread`**: the main thread asks a streaming thread (`mg_stream`) for it and waits.
+
+The pack is read with `O_DIRECT`. A real game does not do that; it stands in for assets that are not
+yet in the page cache, without needing root to drop caches. Ground truth is the game's own frame log:
+which frames loaded an asset and how long the game spent on it.
+
+**What could not be reproduced here.** The documented case (C1) is a *download* saturating the disk.
+On this VM a background writer (`bgio`, 8 threads writing 1 MB blocks with `O_DIRECT`) made no
+reliable difference: an 8 MB load took a median 7.3 ms without it and 8.7 ms during its bursts, inside
+the run-to-run spread. The virtual disk sits on fast host storage, and the I/O controller is not
+delegated to an unprivileged user, so the disk cannot be throttled either. Slow or contended storage
+needs bare metal or root (`dm-delay`, `io.max`). What is reproduced is the wait itself.
+
+**Result** (60 s each, `HITCHTRACE_ARGS=-U`, hitchtrace at 4ca8a3b):
+
+| | `iomain` | `iothread` |
+|---|---|---|
+| Frames that loaded an asset | 117 | 117 |
+| Of those, over budget | 89 (76%) | 91 (78%) |
+| Game's own profiler: asset phase in load frames, median | 16.2 ms | 14.4 ms |
+| Other frames over budget (noise) | 76 of 3,391 | 74 of 3,380 |
+
+Scoring each over-budget record against the ground truth:
+
+| `iomain`: from one record | Load frames (89) | Noise frames (77) |
+|---|---|---|
+| The record has an I/O group whose chain ends at a device interrupt | **89 (100%)** | 0 |
+| That group's time / the game's own load time, median | **91%**, in 8 waits | |
+| I/O is the **top-ranked** group | 63 (71%) | 0 |
+| I/O would be top under the old rule (longest single wait) | 62 (70%) | 0 |
+
+| `iothread`: from one record | Load frames (91) | Noise frames (75) |
+|---|---|---|
+| Some group reads "waited for `mg_stream`, which was blocked on I/O, ended by an interrupt" | **91 (100%)** | 0 |
+| The chain's first hop / the game's own load time, median | **94%** | |
+| Root's "resolved" line calls ≥ half the overrun an inherited stall | 91 (100%) | 18 (24%) |
+| That group is **top-ranked** | 60 (66%) | 0 |
+
+So the record explains every one of these hitches, with the right amount, and never invents an I/O
+stall in a frame that had none. With `-U` it also names the game's function:
+`pread <- load_asset <- main`. A record from each variant:
+
+```
+hitch frame 809  33.2 ms  (budget 20.8 ms, over by 12.3 ms)  root mg_main          [iomain]
+  blocked   30.5 ms  futex 8.4 | io 15.8 | timer 6.1 | present 0.2
+  stalls     off-CPU time by cause and by who ended it, largest first
+     15.8 ms  io       blocked in blk_io_schedule, 8 times, longest 11.2 ms
+              <- [softirq]         woken from a softirq
+      8.4 ms  futex    blocked in __futex_wait
+              <- mg_worker2        ...
+
+hitch frame 1619  31.6 ms  (budget 20.8 ms, over by 10.7 ms)  root mg_main         [iothread]
+  blocked   29.4 ms  futex 23.7 | timer 5.5 | present 0.2
+  resolved   waiting on a running task 10.1 ms, inherited stalls 13.8 ms
+  stalls     off-CPU time by cause and by who ended it, largest first
+     14.5 ms  futex    blocked in __futex_wait
+              <- mg_stream         blocked 13.8 ms in blk_io_schedule
+                <- [softirq]       woken from a softirq
+      9.2 ms  futex    blocked in __futex_wait
+              <- mg_worker0        was running (waiting for work) 0.0 ms
+```
+
+In the second record the buckets alone say "futex 23.7 ms". The groups split that into a wait on the
+streamer, which was on disk, and the ordinary wait for the workers, which were running. That split is
+what the chain is for.
+
+**Finding: the ranking is polluted by the frame's normal waits.** The I/O explanation is in every
+record but on top in only 66–71% of them. Every frame of this game, good or bad, has about 10 ms of
+waiting for its workers and about 6 ms of frame-limiter sleep. When a load is short, those rank above
+it. In the misses the I/O was a median 6.4 ms against a 9.8 ms worker wait. Ranking by total time
+answers "where did the off-CPU time go", not "what was different about this frame".
+
+Two other rules, replayed on the same records by `analyze_io.py`:
+
+| I/O (or the wait on `mg_stream`) is top-ranked | `iomain` (89) | `iothread` (91) |
+|---|---|---|
+| By total time (current) | 63 (71%) | 60 (66%) |
+| By stall time: a task-ended wait counts only its inherited part | 78 (88%) | 74 (81%) |
+| By excess over a usual frame (per-cause median of the noise records) | 89 (100%) | not computable per cause |
+
+Dropping "waiting on a running task" from the ranking helps but leaves the limiter sleep in the way.
+Ranking by what the frame has **more of than usual** gets every one. It needs a baseline of normal
+frames, which hitchtrace does not keep: normal frames emit nothing and leave nothing behind. A
+per-cause baseline is not enough for `iothread`, where the wait on the streamer and the wait on the
+workers are both futex waits; the baseline has to be per group. The same baseline would also fix the
+"% kernel-observable" header and the share gate, which count these normal waits as stall time.
+
+**Other observations.**
+
+- **Grouping made no difference here** (71% against 70% under the old rule). The load is 8 waits, but
+  one of them is usually long (a median longest of over half the group), so the longest single wait
+  was already I/O. Grouping matters when no single wait stands out, as in `thousand_cuts`.
+- **The chain ends at the device interrupt.** hitchtrace says the thread waited on storage and for how
+  long. It cannot say why the storage was slow or who else was using it, which is exactly what the
+  download case (C1) would need.
+- **No measurable tracing overhead on the load**: interleaved A/B, 3 × 12 s per arm, 48 loads each:
+  a median 7.8 ms untraced, 8.7 ms traced, 9.1 ms traced with `-U`, with a 90th percentile of 18–19 ms
+  in all three. The 14–16 ms medians in the two case runs are this VM's disk being slower at the time.
+- A waker delayed 0.2 ms in an 8.4 ms wait is printed as "kept off the CPU 0.2 ms". True, but the
+  wording gives it more weight than the 8.2 ms it spent running.
+

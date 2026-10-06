@@ -3,6 +3,8 @@
  * minigame: a small game-shaped Vulkan workload for hitchtrace case studies.
  *
  *	mg_main --jobs--> mg_worker0..N-1
+ *	   |  \
+ *	   |   +-- assets <-- mg_stream (-s thread)
  *	   |
  *	   +-- vkQueuePresentKHR()   <- frame marks come from the hitchtrace layer
  *
@@ -10,6 +12,7 @@
  *
  *	limiter   sleep to the frame cap (absolute deadline, 60 fps by default)
  *	sim       move the asteroids (main thread, cheap)
+ *	asset     with -s, every so often: load a large asset (see below)
  *	jobs      split the screen into tiles, hand them to the worker pool
  *		  through one mutex-protected queue, and wait for all of them;
  *		  each tile is drawn in software (per-pixel, per-object)
@@ -29,11 +32,27 @@
  * what an engine's built-in profiler would show for the same frames -- so a
  * case study can compare the two views.
  *
+ * Asset loading (-s MODE -p PACK) makes one frame in every -e FRAMES need a
+ * large asset (-a MB) from a pack file before it can be drawn, as a game does
+ * when the player crosses into a new area. The two modes are the two ways
+ * games end up waiting on storage:
+ *
+ *	main	the main thread reads the asset itself, a megabyte at a time:
+ *		a synchronous load on the thread that must not block
+ *	thread	the main thread asks mg_stream for it and waits: a loader
+ *		that is asynchronous in name, with the frame depending on it
+ *
+ * The pack is read with O_DIRECT. A real game does not do that; it stands in
+ * for assets that are not in the page cache, which is every asset the first
+ * time, without needing root to drop caches between runs.
+ *
  * usage: minigame [-d SECONDS] [-w WORKERS] [-f FPS] [-n OBJECTS]
- *                 [-t TILES] [-o FRAMELOG] [-h]
+ *                 [-t TILES] [-s main|thread -p PACK [-a MB] [-e FRAMES]]
+ *                 [-o FRAMELOG] [-h]
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -42,6 +61,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -62,6 +82,12 @@ static int opt_fps = 60;
 static int opt_objects = 48;
 static int opt_tiles = 24;
 static const char *opt_framelog;
+
+enum { STREAM_OFF, STREAM_MAIN, STREAM_THREAD };
+static int opt_stream = STREAM_OFF;
+static const char *opt_pack;
+static int opt_asset_mb = 8;
+static int opt_every = 20;
 
 static void die(const char *fmt, ...)
 {
@@ -241,6 +267,92 @@ static void run_jobs(void)
 	while (q_pending)
 		pthread_cond_wait(&done_cv, &q_lock);
 	pthread_mutex_unlock(&q_lock);
+}
+
+/* -------------------------------------------------------- asset streaming */
+
+#define PIECE_BYTES	(1024 * 1024)	/* an asset is read a piece at a time */
+
+static int pack_fd = -1;
+static off_t pack_size, pack_pos;
+static unsigned char *piece_buf;
+static volatile uint32_t asset_sum;
+
+static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_ready = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t s_need = PTHREAD_COND_INITIALIZER;
+static uint64_t s_wanted, s_loaded;
+static bool s_quit;
+
+static void stream_open(void)
+{
+	struct stat st;
+
+	pack_fd = open(opt_pack, O_RDONLY | O_DIRECT);
+	if (pack_fd < 0 || fstat(pack_fd, &st))
+		die("cannot open the asset pack %s: %s", opt_pack, strerror(errno));
+	pack_size = st.st_size;
+	if (pack_size < (off_t)opt_asset_mb * PIECE_BYTES)
+		die("%s is smaller than one asset", opt_pack);
+	if (posix_memalign((void **)&piece_buf, 4096, PIECE_BYTES))
+		die("out of memory");
+}
+
+/* Read the next asset from the pack and look at it. One thread at a time. */
+static void load_asset(void)
+{
+	uint32_t sum = 0;
+	size_t k;
+	int i;
+
+	for (i = 0; i < opt_asset_mb; i++) {
+		if (pack_pos + PIECE_BYTES > pack_size)
+			pack_pos = 0;
+		if (pread(pack_fd, piece_buf, PIECE_BYTES, pack_pos) != PIECE_BYTES)
+			die("short read from %s: %s", opt_pack, strerror(errno));
+		pack_pos += PIECE_BYTES;
+		/* stands in for a checksum or a cheap decode */
+		for (k = 0; k < PIECE_BYTES; k += 256)
+			sum += piece_buf[k];
+	}
+	asset_sum = sum;
+}
+
+static void *streamer(void *arg)
+{
+	pthread_setname_np(pthread_self(), "mg_stream");
+	for (;;) {
+		pthread_mutex_lock(&s_lock);
+		while (s_loaded == s_wanted && !s_quit)
+			pthread_cond_wait(&s_need, &s_lock);
+		if (s_quit) {
+			pthread_mutex_unlock(&s_lock);
+			return NULL;
+		}
+		pthread_mutex_unlock(&s_lock);
+
+		load_asset();
+
+		pthread_mutex_lock(&s_lock);
+		s_loaded++;
+		pthread_cond_signal(&s_ready);
+		pthread_mutex_unlock(&s_lock);
+	}
+}
+
+/* The frame needs the next asset before it can be drawn. */
+static void asset_step(void)
+{
+	if (opt_stream == STREAM_MAIN) {
+		load_asset();
+	} else if (opt_stream == STREAM_THREAD) {
+		pthread_mutex_lock(&s_lock);
+		s_wanted++;
+		pthread_cond_signal(&s_need);
+		while (s_loaded < s_wanted)
+			pthread_cond_wait(&s_ready, &s_lock);
+		pthread_mutex_unlock(&s_lock);
+	}
 }
 
 /* ---------------------------------------------------------------- vulkan */
@@ -562,32 +674,35 @@ static void present_frame(uint32_t idx)
  * The game's own view of a frame, as an engine profiler would record it.
  * A frame is present entry to present entry, the same window hitchtrace uses,
  * so the phases of frame N are: present (the call that opened it), limiter,
- * sim, jobs, upload.
+ * sim, asset, jobs, upload.
  */
 struct frame_log {
 	uint64_t t_end_ns;	/* present entry that closed this frame */
-	uint64_t frame_ns, present_ns, limiter_ns, sim_ns, jobs_ns, upload_ns;
+	uint64_t frame_ns, present_ns, limiter_ns, sim_ns, asset_ns, jobs_ns,
+		 upload_ns;
+	bool asset;		/* this frame loaded one */
 };
 
 static void usage(void)
 {
 	fprintf(stderr,
 		"usage: minigame [-d SECONDS] [-w WORKERS] [-f FPS] [-n OBJECTS]\n"
-		"                [-t TILES] [-o FRAMELOG]\n");
+		"                [-t TILES] [-s main|thread -p PACK [-a MB] [-e FRAMES]]\n"
+		"                [-o FRAMELOG]\n");
 	exit(2);
 }
 
 int main(int argc, char **argv)
 {
-	pthread_t workers[MAX_WORKERS];
+	pthread_t workers[MAX_WORKERS], stream_thread;
 	struct frame_log *log, cur = { 0 };
-	uint64_t period, t_stop, deadline, t_prev_present = 0, t0, t1;
+	uint64_t period, t_stop, deadline, t_prev_present = 0, t0, t1, nframe = 0;
 	size_t nlog = 0, caplog;
 	uint32_t idx;
 	long i;
 	int c;
 
-	while ((c = getopt(argc, argv, "d:w:f:n:t:o:h")) != -1) {
+	while ((c = getopt(argc, argv, "d:w:f:n:t:s:p:a:e:o:h")) != -1) {
 		switch (c) {
 		case 'd': opt_duration = atoi(optarg); break;
 		case 'w': opt_workers = atoi(optarg); break;
@@ -595,12 +710,25 @@ int main(int argc, char **argv)
 		case 'n': opt_objects = atoi(optarg); break;
 		case 't': opt_tiles = atoi(optarg); break;
 		case 'o': opt_framelog = optarg; break;
+		case 'p': opt_pack = optarg; break;
+		case 'a': opt_asset_mb = atoi(optarg); break;
+		case 'e': opt_every = atoi(optarg); break;
+		case 's':
+			if (!strcmp(optarg, "main"))
+				opt_stream = STREAM_MAIN;
+			else if (!strcmp(optarg, "thread"))
+				opt_stream = STREAM_THREAD;
+			else
+				usage();
+			break;
 		default: usage();
 		}
 	}
 	if (opt_workers < 1 || opt_workers > MAX_WORKERS || opt_fps < 1 ||
 	    opt_objects < 1 || opt_objects > MAX_OBJECTS ||
-	    opt_tiles < 1 || opt_tiles > MAX_TILES || opt_duration < 1)
+	    opt_tiles < 1 || opt_tiles > MAX_TILES || opt_duration < 1 ||
+	    (opt_stream != STREAM_OFF) != (opt_pack != NULL) ||
+	    opt_asset_mb < 1 || opt_every < 1)
 		usage();
 
 	pthread_setname_np(pthread_self(), "mg_main");
@@ -610,6 +738,11 @@ int main(int argc, char **argv)
 	if (!fb)
 		die("out of memory");
 	game_init();
+	if (opt_stream != STREAM_OFF)
+		stream_open();
+	if (opt_stream == STREAM_THREAD &&
+	    pthread_create(&stream_thread, NULL, streamer, NULL))
+		die("cannot start the streamer");
 	for (i = 0; i < opt_workers; i++)
 		if (pthread_create(&workers[i], NULL, worker, (void *)i))
 			die("cannot start a worker");
@@ -621,8 +754,10 @@ int main(int argc, char **argv)
 		die("out of memory");
 
 	fprintf(stderr, "minigame pid=%d %ux%u workers=%d tiles=%d objects=%d "
-		"cap=%d fps duration=%d s\n", getpid(), fb_w, fb_h, opt_workers,
-		opt_tiles, opt_objects, opt_fps, opt_duration);
+		"cap=%d fps duration=%d s stream=%s\n", getpid(), fb_w, fb_h,
+		opt_workers, opt_tiles, opt_objects, opt_fps, opt_duration,
+		opt_stream == STREAM_MAIN ? "main" :
+		opt_stream == STREAM_THREAD ? "thread" : "off");
 
 	deadline = now_ns();
 	t_stop = deadline + (uint64_t)opt_duration * NSEC;
@@ -641,6 +776,13 @@ int main(int argc, char **argv)
 		game_sim(1.0f / opt_fps);
 		t0 = now_ns();
 		cur.sim_ns = t0 - t1;
+
+		cur.asset = opt_stream != STREAM_OFF && ++nframe % opt_every == 0;
+		if (cur.asset)
+			asset_step();
+		t1 = now_ns();
+		cur.asset_ns = t1 - t0;
+		t0 = t1;
 
 		run_jobs();
 		t1 = now_ns();
@@ -667,6 +809,13 @@ int main(int argc, char **argv)
 	pthread_mutex_unlock(&q_lock);
 	for (i = 0; i < opt_workers; i++)
 		pthread_join(workers[i], NULL);
+	if (opt_stream == STREAM_THREAD) {
+		pthread_mutex_lock(&s_lock);
+		s_quit = true;
+		pthread_cond_signal(&s_need);
+		pthread_mutex_unlock(&s_lock);
+		pthread_join(stream_thread, NULL);
+	}
 	vkDeviceWaitIdle(dev);
 
 	if (opt_framelog) {
@@ -678,12 +827,15 @@ int main(int argc, char **argv)
 		for (k = 0; k < nlog; k++)
 			fprintf(f, "{\"frame\":%zu,\"t_end_ns\":%llu,\"frame_us\":%llu,"
 				"\"present_us\":%llu,\"limiter_us\":%llu,\"sim_us\":%llu,"
-				"\"jobs_us\":%llu,\"upload_us\":%llu}\n", k,
+				"\"asset\":%d,\"asset_us\":%llu,\"jobs_us\":%llu,"
+				"\"upload_us\":%llu}\n", k,
 				(unsigned long long)log[k].t_end_ns,
 				(unsigned long long)log[k].frame_ns / 1000,
 				(unsigned long long)log[k].present_ns / 1000,
 				(unsigned long long)log[k].limiter_ns / 1000,
 				(unsigned long long)log[k].sim_ns / 1000,
+				log[k].asset,
+				(unsigned long long)log[k].asset_ns / 1000,
 				(unsigned long long)log[k].jobs_ns / 1000,
 				(unsigned long long)log[k].upload_ns / 1000);
 		fclose(f);

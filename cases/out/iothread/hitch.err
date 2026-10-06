@@ -1,0 +1,3 @@
+Tracing frames of PID 7974 (marker hitch_frame_mark, budget 20.8 ms)... for 60 seconds, or hit Ctrl-C to end.
+stats: frames=3550 hitches=171 emitted=171 ringbuf-full=0 stalls=14530 resolved=4980 unresolved=6079 storage-fail=0 stack-err=0 slots-full=0
+3550 frames, 171 hitches (4.8%), 171 records
