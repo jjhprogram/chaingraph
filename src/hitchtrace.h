@@ -22,7 +22,8 @@
 #define __HITCHTRACE_H
 
 #define TASK_COMM_LEN		16
-#define HT_MAX_HOPS		5	/* chain hops kept for the worst stall */
+#define HT_MAX_HOPS		5	/* chain hops kept per stall group */
+#define HT_MAX_STALLS		8	/* stall groups per frame; the last is the rest */
 #define HT_PERF_MAX_STACK	32	/* frames per kernel stack */
 #define HT_MAX_THREADS		32	/* per-thread detail slots in a record */
 #define HT_MEDIAN_WINDOW	19	/* frames behind the rolling-median budget */
@@ -78,6 +79,10 @@ enum ht_sysclass {
 #define HT_HOP_TRUNC	(1U << 5)	/* chain continues beyond HT_MAX_HOPS */
 #define HT_HOP_STALE	(1U << 6)	/* waker's own wait ended before this wait began */
 #define HT_HOP_HIST	(1U << 7)	/* waker's history is shorter than the wait: ns is a lower bound */
+#define HT_HOP_PREEMPTOR (1U << 8)	/* took the root's CPU; not a waker */
+
+/* ht_stall.flags */
+#define HT_STALL_OTHER	(1U << 0)	/* the catch-all group: causes and wakers mixed */
 
 #define HT_FRAME_OPEN_STALL	(1U << 0)	/* a stall was still open at frame end */
 #define HT_FRAME_NO_ROOT_STATE	(1U << 1)	/* root state was created mid-frame */
@@ -89,7 +94,7 @@ enum ht_sysclass {
 #define HT_THREAD_BLOCKED_END	(1U << 1)	/* still off-CPU when the frame closed */
 
 /*
- * One hop of the resolved chain for the frame's worst blocked interval.
+ * One hop of the resolved chain behind a stall of the root.
  * hops[0] is the task that woke the root, hops[1] woke hops[0], ...
  */
 struct ht_hop {
@@ -107,15 +112,33 @@ struct ht_hop {
 	char preempt_comm[TASK_COMM_LEN];
 };
 
-/* The worst single blocked interval of the frame, and its chain. */
+/*
+ * A group of the root's off-CPU intervals within one frame: all those with
+ * the same cause that the same thread ended (or that an interrupt ended, or,
+ * for time spent preempted, that the same process caused). A frame's time is
+ * often lost in many short waits on one thing rather than in one long one,
+ * so groups are ranked by their total, and each carries the chain behind its
+ * longest interval.
+ *
+ * A frame keeps HT_MAX_STALLS - 1 such groups; whatever does not get one of
+ * its own is summed in the last, HT_STALL_OTHER, so the groups always add up
+ * to the root's off-CPU time.
+ */
 struct ht_stall {
-	__u64 ns;		/* clipped to the frame window */
-	__u64 start_ns;
+	__u64 ns;		/* total, clipped to the frame window */
+	__u64 longest_ns;	/* the longest single interval of the group ... */
+	__u64 start_ns;		/* ... and when it began */
+	__u64 inherited_ns;	/* of ns: the waker was itself off-CPU */
 	__u32 cause;		/* enum ht_cause */
-	__s32 kstack_id;	/* the root's own blocking stack */
+	__u32 count;		/* intervals in the group; 0 = unused */
+	__u32 key_pid;		/* the waking thread, or the preempting process;
+				 * 0 = an interrupt, or nobody */
+	__u32 flags;		/* HT_STALL_* */
+	__s32 kstack_id;	/* the root's own blocking stack, longest interval */
 	__s32 ustack_id;
 	__u32 nhops;
-	struct ht_hop hops[HT_MAX_HOPS];
+	__u32 __pad;
+	struct ht_hop hops[HT_MAX_HOPS];	/* behind the longest interval */
 };
 
 /*
@@ -146,7 +169,7 @@ struct ht_record {
 	__u64 frame_ns;
 	__u64 budget_ns;
 	__u64 cause_ns[HT_CAUSE_MAX];
-	struct ht_stall worst;
+	struct ht_stall stalls[HT_MAX_STALLS];	/* unordered */
 	__u32 root_pid;
 	__u32 root_tgid;
 	char root_comm[TASK_COMM_LEN];

@@ -2,9 +2,10 @@
 /*
  * hitchtrace  Frame-scoped attribution of stalls: for every frame that misses
  *             its budget, where the frame's time went on the root thread
- *             (on-CPU, runnable, runqueue, blocked), and what the worst
- *             blocked interval was waiting for, resolved through the chain of
- *             wakeups that ended it.
+ *             (on-CPU, runnable, runqueue, blocked), and what it was kept
+ *             waiting for: its off-CPU time grouped by cause and by who
+ *             ended each wait, largest group first, each resolved through
+ *             the chain of wakeups behind it.
  *
  * A frame is the interval between two calls of the workload's frame marker
  * (a uprobe; the argument is the frame id). Only over-budget frames cross to
@@ -83,8 +84,8 @@ enum {
 const char *argp_program_version = "hitchtrace 0.1";
 static const char argp_program_doc[] =
 "Explain frames that missed their budget: the root thread's time split into\n"
-"on-CPU, runnable, runqueue and blocked, and the worst blocked interval\n"
-"resolved through the chain of wakeups behind it.\n"
+"on-CPU, runnable, runqueue and blocked, and its off-CPU time grouped by\n"
+"cause and waker, each group resolved through the chain of wakeups behind it.\n"
 "\n"
 "USAGE: hitchtrace -p PID [OPTION...]\n"
 "\n"
@@ -110,10 +111,11 @@ static const struct argp_option opts[] = {
 	{ "duration", 'd', "SECONDS", 0,
 	  "Stop after this many seconds (default: until Ctrl-C or target exit)", 0 },
 	{ "quiet", 'q', NULL, 0, "No human-readable output (JSONL only)", 0 },
-	{ "user-stacks", 'U', NULL, 0, "Also collect user stacks for the worst stall", 0 },
+	{ "user-stacks", 'U', NULL, 0, "Also collect user stacks for the root's stalls", 0 },
 	{ "min-stall", OPT_MIN_STALL, "USEC", 0,
-	  "Ignore blocked intervals shorter than this when picking the worst "
-	  "stall (default 100)", 0 },
+	  "An off-CPU interval shorter than this does not start a stall group "
+	  "of its own, and a waker delayed less than this was running "
+	  "(default 100)", 0 },
 	{ "hops", OPT_HOPS, "N", 0, "Chain hops to print, 1-5 (default 5)", 0 },
 	{ "budget-mode", OPT_BUDGET_MODE, "fixed|median", 0,
 	  "fixed: -b is the budget. median: the budget follows the app, "
@@ -329,6 +331,7 @@ static const char *short_name(__u32 cause)
 /* bit position -> name, for the JSON flag lists */
 static const char *const hop_flag_names[] = {
 	"irq", "softirq", "irqexit", "idle", "oncpu", "trunc", "stale", "hist",
+	"preemptor",
 };
 static const char *const frame_flag_names[] = {
 	"open_stall", "no_root_state", "lost", "threads_full",
@@ -603,6 +606,10 @@ static void hop_desc(char *buf, size_t sz, const struct ht_hop *h)
 		snprintf(buf, sz, "%s%s", what, stale);
 		return;
 	}
+	if (h->flags & HT_HOP_PREEMPTOR) {
+		snprintf(buf, sz, "held the CPU");
+		return;
+	}
 	if (h->flags & HT_HOP_ONCPU) {
 		snprintf(buf, sz, "was running (waiting for work) %.1f ms%s",
 			 ms(h->ns), stale);
@@ -649,7 +656,7 @@ static void hop_desc(char *buf, size_t sz, const struct ht_hop *h)
 }
 
 /* description column of the chain, so nested hops stay aligned */
-#define HOP_DESC_COL	25
+#define HOP_DESC_COL	40
 
 static void print_hop(int indent, const char *label, const char *desc)
 {
@@ -658,10 +665,9 @@ static void print_hop(int indent, const char *label, const char *desc)
 	printf("%*s<- %s%*s%s\n", indent, "", label, pad > 1 ? pad : 1, "", desc);
 }
 
-static void print_chain(const struct ht_stall *st)
+static void print_chain(const struct ht_stall *st, int indent)
 {
 	__u32 n = st->nhops;
-	int indent = 4;
 
 	if (n > HT_MAX_HOPS)
 		n = HT_MAX_HOPS;
@@ -810,8 +816,8 @@ static void thread_detail(char *buf, size_t sz, const struct ht_thread *t)
 		append(buf, sz, &len, "%s(still blocked at frame end %.1f ms)",
 		       len ? " " : "", ms(t->open_ns));
 	/*
-	 * The root's longest interval is the worst stall, printed above with
-	 * its chain; for the other threads this is the only place it shows.
+	 * The root's intervals are the stall groups, printed above with
+	 * their chains; for the other threads this is the only place it shows.
 	 */
 	where = t->largest_ns && !(t->flags & HT_THREAD_ROOT) ?
 		blocked_in(t->largest_kstack) : NULL;
@@ -919,11 +925,80 @@ static void print_timeline(const struct ht_record *r)
 	}
 }
 
+/*
+ * The frame's stall groups, largest total first. The kernel hands them over
+ * in the order they were opened, unused ones included.
+ */
+static __u32 rank_stalls(const struct ht_record *r,
+			 const struct ht_stall *out[HT_MAX_STALLS])
+{
+	__u32 n = 0;
+
+	for (__u32 i = 0; i < HT_MAX_STALLS; i++) {
+		const struct ht_stall *st = &r->stalls[i];
+		__u32 j;
+
+		if (!st->count)
+			continue;
+		for (j = n; j > 0 && out[j - 1]->ns < st->ns; j--)
+			out[j] = out[j - 1];
+		out[j] = st;
+		n++;
+	}
+	return n;
+}
+
+/* groups below this share of the frame are only counted, unless first */
+#define STALL_SHOW_PCT	3
+
+static void print_stalls(const struct ht_record *r)
+{
+	const struct ht_stall *st[HT_MAX_STALLS];
+	__u32 n = rank_stalls(r, st), hidden = 0;
+	__u64 hidden_ns = 0;
+
+	if (!n)
+		return;
+	printf("  stalls     off-CPU time by cause and by who ended it, largest first\n");
+	for (__u32 i = 0; i < n; i++) {
+		const struct ht_stall *s = st[i];
+		bool other = s->flags & HT_STALL_OTHER;
+		const char *where = other ? NULL : blocked_in(s->kstack_id);
+		char what[96];
+		size_t len = 0;
+
+		if (i && s->ns * 100 < r->frame_ns * STALL_SHOW_PCT) {
+			hidden++;
+			hidden_ns += s->ns;
+			continue;
+		}
+		what[0] = '\0';
+		if (other)
+			append(what, sizeof(what), &len, "everything else");
+		else if (where)
+			append(what, sizeof(what), &len, "blocked in %s", where);
+		else if (s->cause == HT_RUNNABLE)
+			append(what, sizeof(what), &len, "preempted");
+		else
+			append(what, sizeof(what), &len, "%s", cause_phrase(s->cause));
+		if (s->count > 1)
+			append(what, sizeof(what), &len, ", %u times, longest %.1f ms",
+			       s->count, ms(s->longest_ns));
+		printf("    %5.1f ms  %-8s %s\n", ms(s->ns),
+		       other ? "other" : s->cause < HT_CAUSE_PARTITION ?
+		       short_name(s->cause) : "?", what);
+		if (!other)
+			print_chain(s, 14);
+	}
+	if (hidden)
+		printf("    %5.1f ms  in %u smaller group%s\n", ms(hidden_ns), hidden,
+		       hidden == 1 ? "" : "s");
+}
+
 static void print_record(const struct ht_record *r)
 {
 	__u64 over = r->frame_ns > r->budget_ns ? r->frame_ns - r->budget_ns : 0;
 	char root[TASK_COMM_LEN + 24], flags[80];
-	const char *where;
 
 	task_label(root, sizeof(root), r->root_comm, r->root_pid);
 	frame_flags_str(flags, sizeof(flags), r->flags);
@@ -941,16 +1016,7 @@ static void print_record(const struct ht_record *r)
 	printf(")  root %s%s\n", root, flags);
 	print_timeline(r);
 
-	if (r->worst.ns) {
-		where = blocked_in(r->worst.kstack_id);
-		if (where)
-			printf("  worst stall %.1f ms  blocked in %s\n",
-			       ms(r->worst.ns), where);
-		else
-			printf("  worst stall %.1f ms  %s\n", ms(r->worst.ns),
-			       cause_phrase(r->worst.cause));
-		print_chain(&r->worst);
-	}
+	print_stalls(r);
 	print_threads(r);
 	printf("  %u stall%s this frame\n\n", r->nstalls, r->nstalls == 1 ? "" : "s");
 	fflush(stdout);
@@ -1127,14 +1193,52 @@ static void json_thread(FILE *f, const struct ht_thread *t)
 	fputc('}', f);
 }
 
+/* One stall group; @st may be NULL for a frame that has none. */
+static void json_stall(FILE *f, const struct ht_stall *st, __u32 tgid)
+{
+	static const struct ht_stall none = { .kstack_id = -1, .ustack_id = -1 };
+	const char *where;
+	__u32 nhops;
+
+	if (!st)
+		st = &none;
+	where = (st->flags & HT_STALL_OTHER) ? NULL : blocked_in(st->kstack_id);
+	nhops = st->nhops > HT_MAX_HOPS ? HT_MAX_HOPS : st->nhops;
+
+	/* ns is the group's total; longest_ns its longest single interval */
+	fprintf(f, "{\"ns\":%llu,\"count\":%u,\"longest_ns\":%llu,"
+		"\"inherited_ns\":%llu,\"start_ns\":%llu,\"cause\":",
+		(unsigned long long)st->ns, st->count,
+		(unsigned long long)st->longest_ns,
+		(unsigned long long)st->inherited_ns,
+		(unsigned long long)st->start_ns);
+	json_str(f, st->cause < HT_CAUSE_MAX ? cause_names[st->cause] : "unknown");
+	fprintf(f, ",\"other\":%s", (st->flags & HT_STALL_OTHER) ? "true" : "false");
+	fprintf(f, ",\"kstack_id\":%d,\"ustack_id\":%d", st->kstack_id,
+		st->ustack_id);
+	fprintf(f, ",\"blocked_in\":");
+	if (where)
+		json_str(f, where);
+	else
+		fprintf(f, "null");
+	fprintf(f, ",\"kstack\":");
+	json_kstack(f, st->kstack_id);
+	fprintf(f, ",\"ustack\":");
+	json_ustack(f, st->ustack_id, tgid);
+	fprintf(f, ",\"hops\":[");
+	for (__u32 i = 0; i < nhops; i++) {
+		fprintf(f, "%s", i ? "," : "");
+		json_hop(f, &st->hops[i]);
+	}
+	fprintf(f, "]}");
+}
+
 static void json_record(FILE *f, const struct ht_record *r)
 {
-	const char *where = blocked_in(r->worst.kstack_id);
-	__u32 nhops = r->worst.nhops;
+	const struct ht_stall *st[HT_MAX_STALLS];
+	__u32 nst = rank_stalls(r, st);
 	__u32 nthreads = r->nthreads;
 
-	if (nhops > HT_MAX_HOPS)
-		nhops = HT_MAX_HOPS;
 	if (nthreads > HT_MAX_THREADS)
 		nthreads = HT_MAX_THREADS;
 
@@ -1162,28 +1266,18 @@ static void json_record(FILE *f, const struct ht_record *r)
 	json_flags(f, r->flags, frame_flag_names,
 		   sizeof(frame_flag_names) / sizeof(frame_flag_names[0]));
 
-	fprintf(f, ",\"worst\":{\"ns\":%llu,\"start_ns\":%llu,\"cause\":",
-		(unsigned long long)r->worst.ns,
-		(unsigned long long)r->worst.start_ns);
-	json_str(f, r->worst.cause < HT_CAUSE_MAX ? cause_names[r->worst.cause]
-						  : "unknown");
-	fprintf(f, ",\"kstack_id\":%d,\"ustack_id\":%d",
-		r->worst.kstack_id, r->worst.ustack_id);
-	fprintf(f, ",\"blocked_in\":");
-	if (where)
-		json_str(f, where);
-	else
-		fprintf(f, "null");
-	fprintf(f, ",\"kstack\":");
-	json_kstack(f, r->worst.kstack_id);
-	fprintf(f, ",\"ustack\":");
-	json_ustack(f, r->worst.ustack_id, r->root_tgid);
-	fprintf(f, ",\"hops\":[");
-	for (__u32 i = 0; i < nhops; i++) {
+	/*
+	 * The stall groups, largest total first. "worst" is the first of
+	 * them again, under the key older readers look for.
+	 */
+	fprintf(f, ",\"worst\":");
+	json_stall(f, nst ? st[0] : NULL, r->root_tgid);
+	fprintf(f, ",\"stalls\":[");
+	for (__u32 i = 0; i < nst; i++) {
 		fprintf(f, "%s", i ? "," : "");
-		json_hop(f, &r->worst.hops[i]);
+		json_stall(f, st[i], r->root_tgid);
 	}
-	fprintf(f, "]}");
+	fputc(']', f);
 
 	/*
 	 * Every thread the frame saw, in slot order. The kernel writes each

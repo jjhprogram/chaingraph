@@ -136,11 +136,67 @@ The hitchbench regression suite still passes (12 of 12 classes), and `worker_blo
 - The chain names the **last** preemptor in the window, not the one that took the most time. In 10% of
   burst frames that was another game thread or a driver thread, because once `bgload` takes cores the
   game's own threads also start preempting each other.
-- Still one waker per wait (point 2), and still one chain per frame (the longest single wait).
+- Still one waker per wait (point 2). This is inherent to a wait on several threads: the chain follows
+  the one that finished last.
 - The "% kernel-observable" header is unchanged and still not usable.
-- A record grew from 6,896 to 7,056 bytes. Per-task kernel state grew by about 1.8 KB.
 - `paper/` describes the old accounting (§4.4 "Resolution", the record size) and its hitchbench numbers
   come from runs made before this change.
+
+## Stall groups: more than one chain per frame
+
+hitchtrace used to explain **one** stall per frame: the root's longest single blocked interval. That
+fails whenever a frame's time is lost in many short waits on one thing, or to preemption, which was
+never a candidate. A harmless contiguous sleep then wins and the chain explains the wrong thing.
+
+A record now carries the root's off-CPU time as **groups**: all intervals with the same cause that the
+same thread ended (or an interrupt, or, for preemption, the same process). Groups are ranked by total
+time and each carries the chain behind its longest interval. Seven groups get a slot; when the table
+is full, the smallest is folded into an eighth, "other", so the groups always sum to the root's off-CPU
+time (checked on 348 of 348 records across both workloads). Time the root spent preempted, or woken and
+waiting for a CPU, forms groups too.
+
+**Old rule against new rule, on the same records.** A record has enough to replay the old rule, so both
+are scored on identical hitchbench frames: how often does the top-ranked stall have the cause the
+injector produced? (`tests/rank_rules.py`, on a full `run_hitch_tests.sh` run, 12 of 12 classes passing.)
+
+| Class | Injected frames | Old rule: longest single wait | New rule: largest group |
+|---|---|---|---|
+| `thousand_cuts` (40 sleeps of 0.5 ms) | 16 | 0 | **16** |
+| `preempt` (root shares a CPU with hogs) | 17 | 0 | **17** |
+| `io` | 18 | 13 | 13 |
+| `sleep`, `poll`, `worker_block`, `worker_cpu`, `present_long`, `present_off` | 100 | 100 | 100 |
+| **Total** | **151** | **113 (75%)** | **146 (97%)** |
+
+For `thousand_cuts` the top group reads "timer, 40 times, longest 0.7 ms"; for `preempt` its first hop
+names the hog process in 17 of 17. The five `io` misses are frames where the present wait really was
+longer than the I/O.
+
+The background-CPU case is unchanged by this (`out/bgcpu-groups`: chain credits 100%, names `bgload`
+in 91% of burst frames, 0 of 65 noise frames), as it should be: there the root has one long wait per
+frame. A record from that run:
+
+```
+hitch frame 3119  28.9 ms  (budget 20.8 ms, over by 8.1 ms)  root mg_main
+  blocked   28.2 ms  futex 21.4 | timer 6.6 | present 0.2
+  resolved   waiting on a running task 10.9 ms, inherited stalls 10.7 ms
+  stalls     off-CPU time by cause and by who ended it, largest first
+     21.4 ms  futex    blocked in __futex_wait
+              <- mg_worker2   kept off the CPU 10.6 ms, last preempted by bgload0
+      6.6 ms  timer    blocked in do_nanosleep
+              <- [hardirq]    woken by an interrupt
+      0.4 ms  in 3 smaller groups
+```
+
+**Costs and limits.**
+
+- A record is now 10,336 bytes (was 7,056): eight groups of 464 bytes instead of one stall.
+- Each group keeps the chain of its **longest** interval only. Forty waits on forty different chains
+  behind the same waker would show one of them.
+- On-CPU kernel time (page faults, reclaim, compaction) is still a bucket and not a group, so it is
+  not in the ranking.
+- The JSON keeps a `worst` object for older readers. It is now the largest group, so `worst.ns` is a
+  group total; the longest single interval is `longest_ns`. `paper/scripts/hitchbench_results.py`
+  still reads `worst.ns` as the latter and needs updating before it is run on new data.
 
 **Incidental finding.** In the first, noisier run (`out/bgcpu`), the top preemptor in the *noise*
 frames was `llvmpipe-N`: threads of another process doing software rendering, most likely the desktop

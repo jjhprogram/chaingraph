@@ -165,7 +165,6 @@ struct task_state {
 	__u32 nstalls;
 	__u32 frame_flags;
 	__u64 cause_ns[HT_CAUSE_MAX];
-	struct ht_stall worst;
 };
 
 struct {
@@ -212,6 +211,24 @@ struct {
 	__type(key, __u32);
 	__type(value, struct frame_ctx);
 } frame_state SEC(".maps");
+
+/*
+ * The open frame's stall groups. They belong to the root alone, which is one
+ * thread, so they live here rather than in every task's storage; ->owner
+ * keeps a second presenting thread from mixing its intervals in.
+ */
+struct stall_table {
+	__u32 owner;		/* the root these belong to */
+	__u32 __pad;
+	struct ht_stall g[HT_MAX_STALLS];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct stall_table);
+} root_stalls SEC(".maps");
 
 /*
  * Per-thread detail for the open frame. Each thread writes its own slot as it
@@ -940,15 +957,96 @@ static __always_inline void carve_oncpu(struct task_state *ts, __u32 bucket,
 	carve(ts->cause_ns, bucket, ns);
 }
 
-/*
- * Resolve a blocked interval [lo, hi) of the root through its wake chain and
- * record it as the frame's worst stall if it is the longest so far.
- */
-static __always_inline void resolve(struct task_state *ts, __u64 lo, __u64 hi,
-				    __u32 cause, __u64 blocked_ns, bool resolvable)
+static __always_inline struct stall_table *stall_table(struct task_struct *root)
 {
-	struct ht_stall *w = &ts->worst;
+	struct stall_table *tbl;
+	__u32 zero = 0;
+
+	tbl = bpf_map_lookup_elem(&root_stalls, &zero);
+	return tbl && tbl->owner == (__u32)root->pid ? tbl : NULL;
+}
+
+/*
+ * Add an interval of @ns to the group for (@cause, @key_pid) and return the
+ * group if this is now its longest interval, for the caller to describe.
+ *
+ * An interval gets a group of its own if one is free, or by displacing the
+ * smallest group once it is bigger than that group's whole total; what is
+ * displaced, and whatever is too short to be a stall, is summed in the last
+ * group.
+ */
+static __always_inline struct ht_stall *stall_account(struct stall_table *tbl,
+						      __u32 cause, __u32 key_pid,
+						      __u64 start, __u64 ns,
+						      __u64 inherited)
+{
+	struct ht_stall *other = &tbl->g[HT_MAX_STALLS - 1], *g = NULL;
+	__u32 i, free = HT_MAX_STALLS, min = HT_MAX_STALLS;
+	__u64 min_ns = ~0ULL;
+
+	for (i = 0; i < HT_MAX_STALLS - 1; i++) {
+		struct ht_stall *c = &tbl->g[i];
+
+		if (!c->count) {
+			if (free == HT_MAX_STALLS)
+				free = i;
+			continue;
+		}
+		if (c->cause == cause && c->key_pid == key_pid) {
+			g = c;
+			break;
+		}
+		if (c->ns < min_ns) {
+			min_ns = c->ns;
+			min = i;
+		}
+	}
+	if (!g && ns >= min_stall_ns) {
+		if (free < HT_MAX_STALLS - 1) {
+			g = &tbl->g[free];
+		} else if (min < HT_MAX_STALLS - 1 && ns > min_ns) {
+			g = &tbl->g[min];
+			other->ns += g->ns;
+			other->count += g->count;
+			other->inherited_ns += g->inherited_ns;
+			other->flags |= HT_STALL_OTHER;
+			/* the rest keeps the chain of its own longest interval */
+			__builtin_memset(g, 0, sizeof(*g));
+		}
+		if (g) {
+			g->cause = cause;
+			g->key_pid = key_pid;
+		}
+	}
+	if (!g) {
+		g = other;
+		g->flags |= HT_STALL_OTHER;
+	}
+
+	g->ns += ns;
+	g->count++;
+	g->inherited_ns += inherited;
+	if (ns <= g->longest_ns)
+		return NULL;
+	g->longest_ns = ns;
+	g->start_ns = start;
+	if (g->flags & HT_STALL_OTHER) {
+		g->cause = cause;
+		g->key_pid = key_pid;
+	}
+	return g;
+}
+
+/*
+ * Resolve a blocked interval [lo, hi) of the root through its wake chain,
+ * and add it to the frame's stall groups.
+ */
+static __always_inline void resolve(struct task_state *ts, struct stall_table *tbl,
+				    __u64 lo, __u64 hi, __u32 cause,
+				    __u64 blocked_ns, bool resolvable)
+{
 	__u64 win_lo = lo, win_hi = hi, inherited;
+	struct ht_stall *w;
 	__u32 i, nhops = 0;
 
 	/*
@@ -960,7 +1058,7 @@ static __always_inline void resolve(struct task_state *ts, __u64 lo, __u64 hi,
 	inherited = ts->links[0].sched_ns + ts->links[0].blocked_ns;
 	if (inherited > blocked_ns)
 		inherited = blocked_ns;
-	if (ts->links[0].flags & (HT_HOP_IRQ | HT_HOP_IRQEXIT | HT_HOP_IDLE))
+	if (!resolvable)
 		inherited = 0;
 	if (resolvable) {
 		add_cause(ts, HT_RESOLVED_INHERITED, inherited);
@@ -969,15 +1067,18 @@ static __always_inline void resolve(struct task_state *ts, __u64 lo, __u64 hi,
 		stat_inc(inherited ? HT_STAT_RESOLVED : HT_STAT_UNRESOLVED);
 	}
 
-	if (blocked_ns <= w->ns || blocked_ns < min_stall_ns)
+	if (!tbl)
+		return;
+	/* waits that the same task ended are one group; so are an interrupt's */
+	w = stall_account(tbl, cause, resolvable ? ts->links[0].pid : 0, lo,
+			  blocked_ns, inherited);
+	if (!w)
 		return;
 
-	__builtin_memset(w, 0, sizeof(*w));
-	w->ns = blocked_ns;
-	w->start_ns = lo;
-	w->cause = cause;
+	/* the group's longest interval so far: its stacks, and its chain */
 	w->kstack_id = ts->out_kstack;
 	w->ustack_id = ts->out_ustack;
+	__builtin_memset(w->hops, 0, sizeof(w->hops));
 
 	for (i = 0; i < HT_MAX_HOPS; i++) {
 		struct hop_link *l = &ts->links[i];
@@ -1050,6 +1151,49 @@ static __always_inline void resolve(struct task_state *ts, __u64 lo, __u64 hi,
 			win_hi = l->wake_ts;
 	}
 	w->nhops = nhops;
+}
+
+/*
+ * The root spent [lo, lo + ns) preempted: a stall like any other, whose
+ * cause is whoever held the CPU meanwhile. Grouped by the process that did,
+ * not the thread: a busy neighbour takes the CPU with whichever of its
+ * threads is next, and split up thread by thread its total would hide.
+ */
+static __always_inline void account_preempted(struct task_state *ts,
+					      struct stall_table *tbl,
+					      __u64 lo, __u64 ns)
+{
+	struct ht_stall *w;
+	struct ht_hop *h;
+
+	w = stall_account(tbl, HT_RUNNABLE, ts->preempt_tgid, lo, ns, 0);
+	if (!w)
+		return;
+	w->kstack_id = -1;
+	w->ustack_id = -1;
+	__builtin_memset(w->hops, 0, sizeof(w->hops));
+	h = &w->hops[0];
+	h->pid = ts->preempt_pid;
+	h->tgid = ts->preempt_tgid;
+	__builtin_memcpy(h->comm, ts->preempt_comm, TASK_COMM_LEN);
+	h->ns = ns;
+	h->cause = HT_ONCPU;
+	h->kstack_id = -1;
+	h->flags = HT_HOP_PREEMPTOR;
+	w->nhops = ts->preempt_pid ? 1 : 0;
+}
+
+/* The root, woken, waited [lo, lo + ns) for a CPU. Nobody is on record for it. */
+static __always_inline void account_runqueue(struct stall_table *tbl, __u64 lo,
+					     __u64 ns)
+{
+	struct ht_stall *w = stall_account(tbl, HT_RUNQUEUE, 0, lo, ns, 0);
+
+	if (!w)
+		return;
+	w->kstack_id = -1;
+	w->ustack_id = -1;
+	w->nhops = 0;
 }
 
 SEC("tp_btf/sched_switch")
@@ -1192,14 +1336,22 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
 	}
 
 	if (ts->is_root && ts->frame_start) {
+		struct stall_table *tbl = stall_table(next);
+		__u64 rq_ns = clip(hi, now, ts->frame_start);
+
 		blocked_ns = clip(lo, hi, ts->frame_start);
+		if (lo < ts->frame_start)
+			lo = ts->frame_start;
 		add_cause(ts, cause, blocked_ns);
-		add_cause(ts, HT_RUNQUEUE, clip(hi, now, ts->frame_start));
+		add_cause(ts, HT_RUNQUEUE, rq_ns);
 		ts->nstalls++;
 		stat_inc(HT_STAT_STALLS);
 		if (cause != HT_RUNNABLE && blocked_ns)
-			resolve(ts, lo > ts->frame_start ? lo : ts->frame_start,
-				hi, cause, blocked_ns, resolvable);
+			resolve(ts, tbl, lo, hi, cause, blocked_ns, resolvable);
+		else if (tbl && blocked_ns)
+			account_preempted(ts, tbl, lo, blocked_ns);
+		if (tbl && rq_ns)
+			account_runqueue(tbl, hi > lo ? hi : lo, rq_ns);
 	}
 
 	ts->out_ts = 0;
@@ -1218,6 +1370,7 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 	struct task_struct *cur = bpf_get_current_task_btf();
 	__u64 now = bpf_ktime_get_ns(), frame_ns;
 	struct frame_ctx *fc = frame_ctx();
+	struct stall_table *tbl;
 	struct task_state *ts;
 	struct ht_record *rec;
 	__u64 eff_budget, stall_ns;
@@ -1301,8 +1454,18 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 				rec->stall_ns = stall_ns;
 				__builtin_memcpy(rec->cause_ns, ts->cause_ns,
 						 sizeof(rec->cause_ns));
-				__builtin_memcpy(&rec->worst, &ts->worst,
-						 sizeof(rec->worst));
+				/* group by group: one copy of the whole table
+				 * is more than the compiler will inline */
+				tbl = stall_table(cur);
+				for (i = 0; i < HT_MAX_STALLS; i++) {
+					if (tbl)
+						__builtin_memcpy(&rec->stalls[i],
+								 &tbl->g[i],
+								 sizeof(rec->stalls[i]));
+					else
+						__builtin_memset(&rec->stalls[i], 0,
+								 sizeof(rec->stalls[i]));
+				}
 				rec->root_pid = cur->pid;
 				rec->root_tgid = cur->tgid;
 				__builtin_memcpy(rec->root_comm, cur->comm,
@@ -1435,7 +1598,14 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 	ts->frame_flags = 0;
 	ts->in_ts = now;
 	__builtin_memset(ts->cause_ns, 0, sizeof(ts->cause_ns));
-	__builtin_memset(&ts->worst, 0, sizeof(ts->worst));
+	/* the groups start over with the frame; the last root to mark owns them */
+	i = 0;
+	tbl = bpf_map_lookup_elem(&root_stalls, &i);
+	if (tbl) {
+		tbl->owner = cur->pid;
+		for (i = 0; i < HT_MAX_STALLS; i++)
+			__builtin_memset(&tbl->g[i], 0, sizeof(tbl->g[i]));
+	}
 	return 0;
 }
 
