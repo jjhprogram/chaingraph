@@ -6,3 +6,6 @@
 
 __pycache__/
 *.pyc
+
+# hitchview pages, regenerated from hitch.jsonl by tools/hitchview.py
+/cases/out/*/hitch.html

@@ -1,0 +1,697 @@
+<!doctype html>
+<!--
+  hitchview: one page for a hitchtrace run. tools/hitchview.py fills in the
+  data; everything else is in this file, with no external resources.
+
+  Names in the data (thread names, kernel symbols) come from the traced
+  machine. They are only ever inserted as text nodes.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hitchview</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e;
+  --muted: #898781; --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,.10);
+  --wash: rgba(11,11,11,.04);
+  /* categorical, fixed by what the time was spent on */
+  --c-kern: #2a78d6; --c-sched: #eb6834; --c-lock: #1baf7a; --c-io: #eda100;
+  --c-sleep: #e87ba4; --c-disp: #008300; --c-other: #4a3aa7;
+  /* not a series: the game running, here or on the thread being waited for */
+  --c-run: #c3c2b7; --c-open: #e9e8e2;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7;
+    --muted: #898781; --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,.10);
+    --wash: rgba(255,255,255,.05);
+    --c-kern: #3987e5; --c-sched: #d95926; --c-lock: #199e70; --c-io: #c98500;
+    --c-sleep: #d55181; --c-disp: #008300; --c-other: #9085e9;
+    --c-run: #5a5954; --c-open: #2c2c2a;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7;
+  --muted: #898781; --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,.10);
+  --wash: rgba(255,255,255,.05);
+  --c-kern: #3987e5; --c-sched: #d95926; --c-lock: #199e70; --c-io: #c98500;
+  --c-sleep: #d55181; --c-disp: #008300; --c-other: #9085e9;
+  --c-run: #5a5954; --c-open: #2c2c2a;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1120px; margin: 0 auto; padding: 20px 16px 48px; }
+h1 { font-size: 18px; margin: 0 0 2px; font-weight: 600; }
+h2 { font-size: 14px; margin: 0 0 2px; font-weight: 600; }
+.sub { color: var(--ink-2); margin: 0 0 12px; }
+.note { color: var(--muted); font-size: 12px; margin: 2px 0 10px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 14px 16px; margin: 0 0 14px; }
+svg { display: block; overflow: visible; }
+svg text { font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--muted);
+  font-variant-numeric: tabular-nums; }
+.pick { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; margin: 0 0 12px; }
+.pick button { font: inherit; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--axis); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+.pick button:hover { background: var(--wash); }
+.pick button:disabled { color: var(--muted); cursor: default; background: transparent; }
+.pick .big { font-size: 22px; font-weight: 600; }
+.pick .over { color: var(--ink-2); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0 0 12px; color: var(--ink-2);
+  font-size: 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+/* a label column and a plot column: every plot shares one millisecond scale */
+.row { display: grid; grid-template-columns: 190px minmax(0, 1fr); column-gap: 12px;
+  align-items: start; }
+.row + .row { margin-top: 10px; }
+.lab { font-size: 13px; overflow-wrap: anywhere; }
+.lab b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.lab small { display: block; color: var(--muted); font-size: 12px; }
+.dim .lab, .dim .chain { color: var(--muted); }
+.chain { list-style: none; margin: 4px 0 0; padding: 0; font-size: 13px; color: var(--ink-2); }
+.chain li { display: flex; gap: 6px; align-items: baseline; }
+.chain .arrow { color: var(--muted); flex: none; }
+.chain .who { color: var(--ink); font-weight: 600; }
+.chain .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; align-self: center; }
+.tl-labs div { height: 22px; line-height: 22px; font-size: 12px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.tl-labs b { font-weight: 600; }
+.tl-labs span { color: var(--muted); }
+.threads .row + .row { margin-top: 5px; }
+.threads .lab { font-size: 12px; }
+.threads .ann { font-size: 12px; color: var(--muted); margin-top: 1px; }
+details { margin-top: 10px; }
+summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
+table { border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+th, td { text-align: left; padding: 3px 14px 3px 0; border-bottom: 1px solid var(--grid);
+  vertical-align: top; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+tr.sel td { font-weight: 600; }
+tbody.click tr { cursor: pointer; }
+tbody.click tr:hover td { background: var(--wash); }
+pre { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink-2);
+  margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+#tip { position: fixed; pointer-events: none; z-index: 10; display: none; max-width: 340px;
+  background: var(--ink); color: var(--surface); border-radius: 6px; padding: 6px 9px;
+  font-size: 12px; line-height: 1.35; }
+#tip b { display: block; font-size: 13px; }
+[data-tip] { cursor: default; }
+[data-tip]:hover, [data-tip]:focus { filter: brightness(1.12); outline: none; }
+.dotsel { cursor: pointer; }
+@media (max-width: 640px) { .row { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">hitchview</h1>
+  <p class="sub" id="subtitle"></p>
+
+  <section class="card">
+    <h2>Every hitch in the run</h2>
+    <p class="note">One dot per frame over budget. Click a dot, or use the arrow keys, to look inside a frame.</p>
+    <div id="overview"></div>
+    <details>
+      <summary>All hitch frames as a table</summary>
+      <table>
+        <thead><tr><th class="n">frame</th><th class="n">at</th><th class="n">frame time</th>
+          <th class="n">over budget</th><th>largest stall</th></tr></thead>
+        <tbody id="frames" class="click"></tbody>
+      </table>
+    </details>
+  </section>
+
+  <section class="card">
+    <div class="pick">
+      <button id="prev" aria-label="Previous hitch">&larr; previous</button>
+      <span class="big" id="f-time"></span>
+      <span class="over" id="f-over"></span>
+      <button id="next" aria-label="Next hitch">next &rarr;</button>
+    </div>
+    <div class="legend" id="legend"></div>
+
+    <div id="tl">
+      <h2>Timeline of the frame</h2>
+      <p class="note" id="tl-note"></p>
+      <div class="row"><div class="tl-labs" id="tl-labs"></div><div id="tl-plot"></div></div>
+    </div>
+
+    <h2 style="margin-top:18px">Where the frame went</h2>
+    <p class="note" id="root-note"></p>
+    <div class="row"><div class="lab" id="root-lab"></div><div id="root-plot"></div></div>
+
+    <h2 style="margin-top:18px">What it was waiting for</h2>
+    <p class="note">The thread's time off the CPU, grouped by cause and by who ended each wait, largest
+      first. Grey is time spent waiting for a thread that was itself running: the game's own work,
+      not a stall. Under each bar: who it waited for, and what that thread was waiting for in turn.</p>
+    <div id="stalls"></div>
+
+    <h2 style="margin-top:18px">The process's threads during this frame</h2>
+    <p class="note">Each thread's own time on the same scale. Threads run in parallel, so these do
+      not add up to the frame.</p>
+    <div id="threads" class="threads"></div>
+
+    <details>
+      <summary>This frame as a table, with stacks</summary>
+      <div id="tables"></div>
+    </details>
+  </section>
+</main>
+<div id="tip" role="status"></div>
+
+<script>
+"use strict";
+const DATA = /*DATA*/null;
+
+/* What the time was spent on, in stacking order. `run` is not a series. */
+const CATS = [
+  { id: "run",   label: "running: the game's own work", keys: ["oncpu"] },
+  { id: "kern",  label: "running in the kernel (page faults, reclaim)",
+    keys: ["oncpu_fault", "oncpu_fault_major", "oncpu_reclaim", "oncpu_compact"] },
+  { id: "sched", label: "ready, but waiting for a CPU", keys: ["runnable", "runqueue"] },
+  { id: "lock",  label: "waiting on a lock (futex)", keys: ["block_futex"] },
+  { id: "io",    label: "waiting on disk I/O", keys: ["block_io"] },
+  { id: "sleep", label: "sleeping on a timer", keys: ["block_timer"] },
+  { id: "disp",  label: "waiting on the display or GPU", keys: ["block_present", "block_gpu"] },
+  { id: "other", label: "other waits", keys: ["block_poll", "block_task", "block_other"] },
+];
+const SHORT = { run: "running", kern: "kernel", sched: "waiting for a CPU", lock: "lock",
+  io: "disk I/O", sleep: "timer sleep", disp: "display/GPU", other: "other wait" };
+const CAT_OF = {};
+for (const c of CATS) for (const k of c.keys) CAT_OF[k] = c.id;
+const catLabel = (id) => CATS.find((c) => c.id === id).label;
+const color = (id) => `var(--c-${id})`;
+
+const SVG = "http://www.w3.org/2000/svg";
+const $ = (id) => document.getElementById(id);
+function h(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (k === "class") e.className = v; else if (k === "text") e.textContent = v;
+    else e.setAttribute(k, v);
+  }
+  for (const kid of kids) if (kid != null) e.append(kid);
+  return e;
+}
+function s(tag, attrs, parent) {
+  const e = document.createElementNS(SVG, tag);
+  for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+  if (parent) parent.append(e);
+  return e;
+}
+const ms = (ns) => ns / 1e6;
+const fmt = (ns) => { const v = ms(ns); return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + " ms"; };
+const clear = (e) => { while (e.firstChild) e.firstChild.remove(); return e; };
+
+/* ---------------------------------------------------------------- tooltip */
+const tip = $("tip");
+function showTip(ev, lines) {
+  clear(tip);
+  lines.forEach((t, i) => tip.append(h(i ? "div" : "b", { text: t })));
+  tip.style.display = "block";
+  const r = tip.getBoundingClientRect();
+  let x = (ev.clientX ?? 0) + 14, y = (ev.clientY ?? 0) + 14;
+  if (x + r.width > innerWidth - 8) x = innerWidth - r.width - 8;
+  if (y + r.height > innerHeight - 8) y = (ev.clientY ?? 0) - r.height - 10;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+function tipOn(el, lines) {
+  el.setAttribute("data-tip", "");
+  el.setAttribute("tabindex", "0");
+  el.setAttribute("aria-label", lines.join(". "));
+  el.addEventListener("pointermove", (ev) => showTip(ev, lines));
+  el.addEventListener("pointerleave", () => { tip.style.display = "none"; });
+  el.addEventListener("focus", () => {
+    const b = el.getBoundingClientRect();
+    showTip({ clientX: b.left + b.width / 2, clientY: b.bottom }, lines);
+  });
+  el.addEventListener("blur", () => { tip.style.display = "none"; });
+}
+
+/* ------------------------------------------------------------------ scales */
+function niceStep(span, target) {
+  const raw = span / target, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 5, 10]) if (raw <= m * mag) return m * mag;
+  return 10 * mag;
+}
+function ticks(max, target) {
+  const step = niceStep(max, target), out = [];
+  for (let v = 0; v <= max + 1e-9; v += step) out.push(+v.toFixed(6));
+  return out;
+}
+/* text on a fill: ink or white, by the fill's luminance */
+function inkOn(cssVar) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(cssVar.slice(4, -1)).trim();
+  const n = parseInt(v.slice(1), 16), r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 > 0.55 ? "#0b0b0b" : "#ffffff";
+}
+const TEXT_W = 6.1;	/* px per character at 11px, generous */
+
+/* A horizontal stack of segments [{cat, ns, tip, label}] on the shared scale. */
+function stack(parent, W, x, segs, opts) {
+  const { top = 0, thick = 16, gridTicks = null, height = top + thick, budget = null,
+          endLabel = null } = opts || {};
+  const svg = s("svg", { width: W, height, viewBox: `0 0 ${W} ${height}`, role: "img" }, parent);
+  if (gridTicks) for (const t of gridTicks)
+    s("line", { x1: x(t), x2: x(t), y1: 0, y2: height, stroke: "var(--grid)" }, svg);
+  let pos = 0;
+  const live = segs.filter((g) => g.ns > 0);
+  live.forEach((g, i) => {
+    const x0 = x(ms(pos)), x1 = x(ms(pos + g.ns));
+    pos += g.ns;
+    const w = Math.max(x1 - x0 - (i < live.length - 1 ? 2 : 0), 1);	/* 2px surface gap */
+    const last = i === live.length - 1, r = last ? Math.min(4, w / 2, thick / 2) : 0;
+    const d = `M${x0},${top}h${w - r}a${r},${r} 0 0 1 ${r},${r}v${thick - 2 * r}` +
+              `a${r},${r} 0 0 1 ${-r},${r}h${-(w - r)}z`;
+    const p = s("path", { d, fill: g.fill || color(g.cat) }, svg);
+    if (g.tip) tipOn(p, g.tip);
+    if (g.label && g.label.length * TEXT_W + 12 <= w) {
+      const t = s("text", { x: x0 + 6, y: top + thick / 2 + 4 }, svg);
+      t.textContent = g.label;
+      t.style.fill = inkOn(g.fill || color(g.cat));
+      t.style.pointerEvents = "none";
+    }
+  });
+  if (endLabel) {
+    const t = s("text", { x: x(ms(pos)) + 6, y: top + thick / 2 + 4 }, svg);
+    t.textContent = endLabel; t.style.fill = "var(--ink-2)";
+  }
+  if (budget != null)
+    s("line", { x1: x(budget), x2: x(budget), y1: 0, y2: height, stroke: "var(--ink-2)" }, svg);
+  return svg;
+}
+
+/* ---------------------------------------------------------------- overview */
+function drawOverview() {
+  const box = clear($("overview")), R = DATA.records;
+  const W = Math.max(box.clientWidth, 320), H = 150, L = 44, B = 22, T = 8, Rm = 96;
+  const t0 = DATA.meta.t0_ns, tEnd = DATA.meta.t1_ns;
+  const span = Math.max((tEnd - t0) / 1e9, 1);
+  const maxMs = Math.max(...R.map((r) => ms(r.frame_ns)), ms(DATA.meta.budget_ns)) * 1.08;
+  const x = (sec) => L + (sec / span) * (W - L - Rm);
+  const y = (v) => T + (1 - v / maxMs) * (H - T - B);
+  const svg = s("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "Frame time of every hitch over the run" }, box);
+  for (const v of ticks(maxMs, 4)) {
+    s("line", { x1: L, x2: W - Rm, y1: y(v), y2: y(v), stroke: v ? "var(--grid)" : "var(--axis)" }, svg);
+    s("text", { x: L - 6, y: y(v) + 4, "text-anchor": "end" }, svg).textContent = v + " ms";
+  }
+  for (const v of ticks(span, 8))
+    s("text", { x: x(v), y: H - 6, "text-anchor": "middle" }, svg).textContent = v + " s";
+  const by = y(ms(DATA.meta.budget_ns));
+  s("line", { x1: L, x2: W - Rm, y1: by, y2: by, stroke: "var(--ink-2)" }, svg);
+  /* beside the plot, where no dot can sit under it */
+  const bl = s("text", { x: W - Rm + 8, y: by + 4 }, svg);
+  bl.textContent = "budget " + fmt(DATA.meta.budget_ns); bl.style.fill = "var(--ink-2)";
+  R.forEach((r, i) => {
+    const cx = x((r.frame_end_ns - t0) / 1e9), cy = y(ms(r.frame_ns));
+    const g = s("g", { class: "dotsel" }, svg);
+    s("circle", { cx, cy, r: 12, fill: "transparent" }, g);		/* hit target */
+    s("circle", { cx, cy, r: i === cur ? 6 : 4, fill: i === cur ? "var(--ink)" : "var(--c-kern)",
+      stroke: "var(--surface)", "stroke-width": 2 }, g);
+    tipOn(g, [`frame ${r.frame_id}: ${fmt(r.frame_ns)}`,
+              `${fmt(r.frame_ns - r.budget_ns)} over budget`, topStallText(r)]);
+    g.addEventListener("click", () => select(i));
+    g.addEventListener("keydown", (ev) => { if (ev.key === "Enter") select(i); });
+  });
+}
+
+/* ------------------------------------------------------------------ a frame */
+function isIrq(hop) { return hop.flags.some((f) => f === "irq" || f === "softirq" || f === "irqexit"); }
+function taskEnded(st) {
+  const h0 = st.hops[0];
+  return !!h0 && !isIrq(h0) && !h0.flags.includes("idle") && !h0.flags.includes("preemptor");
+}
+function who(comm, id) { return comm ? `${comm}/${id}` : `thread ${id}`; }
+function stallTitle(st) {
+  if (st.other) return "everything else";
+  return SHORT[CAT_OF[st.cause] || "other"];
+}
+function topStallText(r) {
+  const st = r.stalls[0];
+  if (!st) return "no off-CPU time";
+  const h0 = st.hops[0];
+  let t = `largest: ${stallTitle(st)} ${fmt(st.ns)}`;
+  if (h0 && !isIrq(h0) && h0.comm) t += ` ← ${h0.comm}`;
+  return t;
+}
+/*
+ * One hop of a chain, as [who, what]. @waited is how long the thread one hop
+ * up waited: a hop that explains under a tenth of it was, in the main, running.
+ */
+function hopText(hop, waited) {
+  const lower = hop.flags.includes("hist") ? " (at least)" : "";
+  const mostlyRunning = waited && hop.ns * 10 < waited && !isIrq(hop) &&
+    !hop.flags.includes("preemptor") && !hop.flags.includes("idle") && !hop.flags.includes("oncpu");
+  if (mostlyRunning)
+    return [who(hop.comm, hop.pid), `was running nearly the whole time (off the CPU for only ` +
+            `${fmt(hop.ns)}): this was a wait for its work`];
+  if (isIrq(hop))
+    return [hop.flags.includes("irq") ? "a hardware interrupt" : "an interrupt (softirq)",
+            "ended the wait: a device or a timer"];
+  if (hop.flags.includes("preemptor")) return [who(hop.comm, hop.pid), "held the CPU"];
+  if (hop.flags.includes("idle")) return ["the idle task", "ended the wait"];
+  if (hop.flags.includes("oncpu"))
+    return [who(hop.comm, hop.pid), "was running the whole time: this was a wait for its work"];
+  if (hop.cause === "runnable") {
+    let t = `was kept off the CPU for ${fmt(hop.ns)}${lower}`;
+    if (hop.preemptor) t += `, last preempted by ${who(hop.preemptor.comm, hop.preemptor.tid)}`;
+    if (hop.ns > hop.sched_ns) t += ` (${fmt(hop.ns - hop.sched_ns)} of it blocked)`;
+    return [who(hop.comm, hop.pid), t];
+  }
+  let t = `was itself ${SHORT[CAT_OF[hop.cause] || "other"] === "disk I/O" ? "waiting on disk I/O" :
+           "blocked (" + SHORT[CAT_OF[hop.cause] || "other"] + ")"} for ${fmt(hop.ns)}${lower}`;
+  if (hop.blocked_in) t += `, in ${hop.blocked_in}`;
+  if (hop.sched_ns * 10 >= hop.ns && hop.sched_ns) t += ` (${fmt(hop.sched_ns)} of it kept off the CPU)`;
+  return [who(hop.comm, hop.pid), t];
+}
+function hopCat(hop, waited) {
+  if (isIrq(hop) || hop.flags.includes("idle")) return null;
+  if (hop.flags.includes("oncpu") || hop.flags.includes("preemptor")) return "run";
+  if (waited && hop.ns * 10 < waited) return "run";
+  return CAT_OF[hop.cause] || "other";
+}
+
+/*
+ * The frame as it happened: one lane per thread, every off-CPU interval at its
+ * real time, an arrow from the waker's lane wherever a thread of the process
+ * ended a wait. Grey is the thread running.
+ */
+const LANE = 22, BAR = 12;
+function drawTimeline(r, W, x, grid, budgetMs) {
+  const wrap = $("tl"), labs = clear($("tl-labs")), plot = clear($("tl-plot"));
+  if (!r.events) {
+    $("tl-note").textContent = "This record has no timeline: it was made with --no-timeline, or by an " +
+      "older hitchtrace. The sections below show its totals and chains.";
+    wrap.querySelector(".row").style.display = "none";
+    return;
+  }
+  wrap.querySelector(".row").style.display = "";
+  const frameNs = r.frame_ns;
+  const busy = (t) => (t.cause_ns.oncpu || 0) + (t.cause_ns.runnable || 0) + (t.cause_ns.runqueue || 0);
+  const threads = r.threads.slice().sort((a, b) => (b.root - a.root) || (busy(b) - busy(a)));
+  const lane = new Map(threads.map((t, i) => [t.tid, i]));
+  const name = new Map(threads.map((t) => [t.tid, t.comm]));
+  const H = threads.length * LANE + 22;
+  const svg = s("svg", { width: W + 70, height: H, viewBox: `0 0 ${W + 70} ${H}`, role: "img",
+    "aria-label": "Timeline of the frame, one lane per thread" }, plot);
+  for (const t of grid)
+    s("line", { x1: x(t), x2: x(t), y1: 0, y2: H - 22, stroke: "var(--grid)" }, svg);
+  const top = (i) => i * LANE + (LANE - BAR) / 2;
+  const xs = (ns) => x(ms(Math.max(0, Math.min(frameNs, ns))));
+  const at = (ns) => `${ns < 0 ? "\u2212" : "+"}${fmt(Math.abs(ns))}`;
+
+  threads.forEach((t, i) => {
+    labs.append(h("div", {}, h(t.root ? "b" : "span", { text: t.comm || "thread" }),
+      h("span", { text: " " + t.tid })));
+    /* running, unless something below says otherwise */
+    const bg = s("rect", { x: 0, y: top(i), width: Math.max(xs(frameNs), 1), height: BAR, rx: 2,
+      fill: "var(--c-run)" }, svg);
+    tipOn(bg, [`${who(t.comm, t.tid)} running`, "no off-CPU interval was logged here"]);
+  });
+
+  const arrows = s("g", {}, null), marks = s("g", {}, null);
+  let covered = new Map();	/* tid -> latest in-time seen, for the open tail */
+  for (const e of r.events) {
+    const i = lane.get(e.t);
+    if (i == null || e.i <= 0 || e.o >= frameNs) continue;
+    covered.set(e.t, Math.max(covered.get(e.t) || 0, e.i));
+    const cat = CAT_OF[e.c] || "other", preempted = e.c === "runnable";
+    const waitNs = e.w - e.o, queueNs = e.i - e.w;
+    const lines = [];
+    if (preempted) {
+      lines.push(`${who(name.get(e.t), e.t)}: preempted for ${fmt(e.i - e.o)}`);
+      if (e.b) lines.push(`${who(e.b.c, e.b.t)} held the CPU`);
+    } else {
+      lines.push(`${who(name.get(e.t), e.t)}: ${catLabel(cat)}, ${fmt(waitNs)}`);
+      if (e.k) lines.push(`in ${e.k}`);
+      if (isIrq({ flags: e.f })) lines.push("ended by an interrupt: a device or a timer");
+      else if (e.b) lines.push(`woken by ${who(e.b.c, e.b.t)}` +
+        (e.b.s >= 100000 ? `, which was itself off the CPU for ${fmt(e.b.s)} of that` : ""));
+      if (queueNs >= 50000) lines.push(`then waited ${fmt(queueNs)} for a CPU`);
+    }
+    lines.push(`from ${at(e.o)} to ${at(e.i)} in the frame` + (e.o < 0 ? " (began before it)" : ""));
+    let arrow = null;
+    /* who ended the wait */
+    if (!preempted && e.w > 0 && e.w <= frameNs) {
+      const xw = xs(e.w), j = e.b ? lane.get(e.b.t) : null;
+      if (j != null && j !== i) {
+        const y0 = top(j) + BAR / 2, y1 = j < i ? top(i) - 1 : top(i) + BAR + 1, d = j < i ? -1 : 1;
+        arrow = s("g", { stroke: "var(--ink-2)", fill: "var(--ink-2)", "stroke-width": 1 }, arrows);
+        s("line", { x1: xw, x2: xw, y1: y0, y2: y1 + d * 4 }, arrow);
+        s("path", { d: `M${xw},${y1}l-3,${d * 5}h6z`, stroke: "none" }, arrow);
+        s("circle", { cx: xw, cy: y0, r: 1.8, stroke: "none" }, arrow);
+      } else if (j == null) {
+        /* from outside the process: an interrupt, or another program */
+        const m = s("path", { d: `M${xw},${top(i) - 1}l-3,-5h6z`,
+          fill: isIrq({ flags: e.f }) ? "var(--muted)" : "var(--ink)" }, marks);
+        m.style.pointerEvents = "none";
+      }
+    }
+    const segs = preempted ? [[e.o, e.i, "sched"]] : [[e.o, e.w, cat], [e.w, e.i, "sched"]];
+    for (const [a, b, c] of segs) {
+      if (b <= 0 || a >= frameNs || b <= a) continue;
+      const x0 = xs(a), w = Math.max(xs(b) - x0, 1);
+      const el = s("rect", { x: x0, y: top(i), width: w, height: BAR, fill: color(c) }, svg);
+      tipOn(el, lines);
+      if (arrow) {
+        el.addEventListener("pointerenter", () => { arrow.setAttribute("stroke-width", 2); arrow.style.stroke = arrow.style.fill = "var(--ink)"; });
+        el.addEventListener("pointerleave", () => { arrow.setAttribute("stroke-width", 1); arrow.style.stroke = arrow.style.fill = ""; });
+      }
+    }
+  }
+  /* a wait still open when the frame ended has no interval yet */
+  threads.forEach((t, i) => {
+    if (!t.open_ns) return;
+    const from = frameNs - t.open_ns;
+    if ((covered.get(t.tid) || 0) > from + 1000) return;	/* it ended as the frame closed */
+    const x0 = xs(from), el = s("rect", { x: x0, y: top(i), width: Math.max(xs(frameNs) - x0, 1),
+      height: BAR, fill: "var(--c-open)" }, svg);
+    tipOn(el, [`${who(t.comm, t.tid)}: still waiting when the frame ended`,
+               `since ${at(from)}, for ${fmt(t.open_ns)} so far`]);
+  });
+  svg.append(arrows, marks);
+  s("line", { x1: x(budgetMs), x2: x(budgetMs), y1: 0, y2: H - 22, stroke: "var(--ink-2)" }, svg);
+  for (const t of grid)
+    s("text", { x: x(t), y: H - 6, "text-anchor": t ? "middle" : "start" }, svg).textContent = t;
+  s("text", { x: x(grid[grid.length - 1]) + 14, y: H - 6 }, svg).textContent = "ms";
+  $("tl-note").textContent = `Every thread of the process, in real time from the start of the frame. Grey: running. Colour: off the CPU, ` +
+    `by what it was waiting for; orange also marks time preempted or queued for a CPU. An arrow comes from ` +
+    `the thread that ended a wait; a small triangle marks a wait ended from outside the process ` +
+    `(pale: an interrupt). ${r.events.length} intervals` +
+    (r.events_dropped ? `; ${r.events_dropped} more did not fit and are missing.` : ".");
+}
+
+let cur = 0;
+function drawFrame() {
+  const r = DATA.records[cur], W0 = $("root-plot").clientWidth || 600, W = Math.max(W0 - 70, 200);
+  const frameMs = ms(r.frame_ns), budgetMs = ms(r.budget_ns);
+  const maxMs = Math.max(frameMs, budgetMs) * 1.02;
+  const x = (v) => (v / maxMs) * W;
+  const grid = ticks(maxMs, 8);
+
+  $("f-time").textContent = `frame ${r.frame_id}: ${fmt(r.frame_ns)}`;
+  $("f-over").textContent = `${fmt(r.frame_ns - r.budget_ns)} over a ${fmt(r.budget_ns)} budget · ` +
+    `hitch ${cur + 1} of ${DATA.records.length}`;
+  $("prev").disabled = cur === 0; $("next").disabled = cur === DATA.records.length - 1;
+  $("root-note").textContent = `The presenting thread, ${who(r.root_comm, r.root_pid)}, from one present to ` +
+    `the next. The bar adds up to the frame time; it shows how much, not when.`;
+
+  drawTimeline(r, W, x, grid, budgetMs);
+
+  /* ---- the root's frame */
+  const lab = clear($("root-lab"));
+  lab.append(h("b", { text: r.root_comm || "root" }), h("small", { text: "the frame's thread" }));
+  const plot = clear($("root-plot"));
+  const segs = CATS.map((c) => {
+    const ns = c.keys.reduce((a, k) => a + (r.cause_ns[k] || 0), 0);
+    return { cat: c.id, ns, label: `${SHORT[c.id]} ${ms(ns).toFixed(1)}`,
+             tip: [`${fmt(ns)} ${c.label}`, `${(100 * ns / r.frame_ns).toFixed(0)}% of the frame`] };
+  });
+  const svg = stack(plot, W + 70, x, segs, { top: 16, thick: 20, height: 78, gridTicks: grid,
+    budget: budgetMs, endLabel: fmt(r.frame_ns) });
+  const bt = s("text", { x: x(budgetMs) + 4, y: 10 }, svg);
+  bt.textContent = "budget " + fmt(r.budget_ns); bt.style.fill = "var(--ink-2)";
+  /* without a timeline, the one thing with a recorded time: each group's longest wait */
+  for (const st of r.events ? [] : r.stalls) {
+    if (!st.longest_ns || st.start_ns < r.frame_start_ns) continue;
+    const a = x(ms(st.start_ns - r.frame_start_ns)), w = Math.max(x(ms(st.longest_ns)) - 1, 2);
+    const m = s("rect", { x: a, y: 44, width: w, height: 8, rx: 2,
+      fill: color(CAT_OF[st.cause] || "other") }, svg);
+    tipOn(m, [`${stallTitle(st)}: longest wait ${fmt(st.longest_ns)}`,
+              `began ${fmt(st.start_ns - r.frame_start_ns)} into the frame`]);
+  }
+  if (!r.events)
+    s("text", { x: 0, y: 64 }, svg).textContent = "when: only the longest wait of each group below has a recorded time";
+  for (const t of grid) s("text", { x: x(t), y: 77, "text-anchor": t ? "middle" : "start" }, svg).textContent = t;
+  s("text", { x: x(grid[grid.length - 1]) + 14, y: 77 }, svg).textContent = "ms";
+
+  /* ---- stall groups */
+  const stalls = clear($("stalls"));
+  if (!r.stalls.length) stalls.append(h("p", { class: "note", text: "This thread was never off the CPU in this frame." }));
+  /* groups under 3% of the frame are only counted, unless nothing else is there */
+  const shown = r.stalls.filter((st, i) => !i || st.ns * 100 >= r.frame_ns * 3);
+  const rest = r.stalls.filter((st) => !shown.includes(st));
+  for (const st of shown) {
+    const cat = st.other ? "other" : CAT_OF[st.cause] || "other";
+    const ended = taskEnded(st);
+    const stallNs = ended ? Math.min(st.inherited_ns, st.ns) : st.ns;
+    const dim = ended && stallNs * 10 < st.ns;	/* almost all of it was waiting for work */
+    const row = h("div", { class: "row" + (dim ? " dim" : "") });
+    const l = h("div", { class: "lab" }, h("b", { text: fmt(st.ns) + " " }),
+      document.createTextNode(stallTitle(st)));
+    const bits = [];
+    if (st.count > 1) bits.push(`${st.count} waits, longest ${fmt(st.longest_ns)}`);
+    if (st.blocked_in && !st.other) bits.push(`in ${st.blocked_in}`);
+    if (bits.length) l.append(h("small", { text: bits.join(" · ") }));
+    const p = h("div");
+    const gsegs = [];
+    if (ended) {
+      gsegs.push({ cat, ns: stallNs, tip: [`${fmt(stallNs)} stalled`,
+        "the thread it waited for was itself off the CPU"] });
+      gsegs.push({ cat: "run", ns: st.ns - stallNs, tip: [`${fmt(st.ns - stallNs)} waiting for work`,
+        "the thread it waited for was running"] });
+    } else {
+      gsegs.push({ cat, ns: st.ns, tip: [`${fmt(st.ns)} ${st.other ? "in waits too small or too many to list" : catLabel(cat)}`] });
+    }
+    stack(p, W + 70, x, gsegs, { thick: 12, height: 14, top: 1, gridTicks: grid, budget: budgetMs });
+    if (!st.other && st.hops.length) {
+      const ul = h("ul", { class: "chain" });
+      st.hops.forEach((hop, i) => {
+        const waited = i ? st.hops[i - 1].ns : st.longest_ns;
+        const [name, what] = hopText(hop, waited), c = hopCat(hop, waited);
+        const li = h("li", { style: `padding-left:${i * 18}px` }, h("span", { class: "arrow", text: "←" }));
+        if (c) li.append(h("span", { class: "dot", style: `background:${color(c)}` }));
+        li.append(h("span", {}, h("span", { class: "who", text: name }), document.createTextNode(" " + what)));
+        ul.append(li);
+      });
+      p.append(ul);
+    }
+    row.append(l, p); stalls.append(row);
+  }
+  if (rest.length)
+    stalls.append(h("p", { class: "note", style: "margin-top:8px", text:
+      `${fmt(rest.reduce((a, st) => a + st.ns, 0))} more in ${rest.length} smaller group` +
+      `${rest.length === 1 ? "" : "s"}; they are in the table below.` }));
+
+  /* ---- threads */
+  const threads = clear($("threads"));
+  const busy = (t) => (t.cause_ns.oncpu || 0) + (t.cause_ns.runnable || 0) + (t.cause_ns.runqueue || 0);
+  const list = r.threads.slice().sort((a, b) => (b.root - a.root) || (busy(b) - busy(a)));
+  for (const t of list) {
+    const row = h("div", { class: "row" });
+    const l = h("div", { class: "lab" }, h("b", { text: t.comm || "thread" }),
+      document.createTextNode(" " + t.tid + (t.root ? " · the frame's thread" : "")));
+    const p = h("div");
+    const tsegs = CATS.map((c) => {
+      const ns = c.keys.reduce((a, k) => a + (t.cause_ns[k] || 0), 0);
+      return { cat: c.id, ns, tip: [`${fmt(ns)} ${c.label}`, who(t.comm, t.tid)] };
+    });
+    if (t.open_ns) tsegs.push({ fill: "var(--c-open)", ns: t.open_ns,
+      tip: [`${fmt(t.open_ns)} still waiting when the frame ended`, who(t.comm, t.tid)] });
+    stack(p, W + 70, x, tsegs, { thick: 10, height: 12, top: 1, gridTicks: grid, budget: budgetMs });
+    const ann = [];
+    if (t.preemptor && t.preemptor.ns)
+      ann.push(`lost the CPU to ${who(t.preemptor.comm, t.preemptor.tid)} (longest ${fmt(t.preemptor.ns)})`);
+    if (!t.root && t.largest && t.largest.ns && t.largest.blocked_in)
+      ann.push(`longest wait ${fmt(t.largest.ns)} in ${t.largest.blocked_in}`);
+    if (t.open_ns) ann.push(`still waiting at frame end`);
+    if (ann.length) p.append(h("div", { class: "ann", text: ann.join(" · ") }));
+    row.append(l, p); threads.append(row);
+  }
+
+  drawTables(r);
+  for (const tr of $("frames").children) tr.classList.toggle("sel", +tr.dataset.i === cur);
+}
+
+function drawTables(r) {
+  const box = clear($("tables"));
+  const t1 = h("table", {}, h("thead", {}, h("tr", {}, h("th", { text: "the frame's thread" }),
+    h("th", { class: "n", text: "ms" }), h("th", { class: "n", text: "share" }))));
+  const b1 = h("tbody");
+  for (const c of CATS) {
+    const ns = c.keys.reduce((a, k) => a + (r.cause_ns[k] || 0), 0);
+    if (ns) b1.append(h("tr", {}, h("td", { text: c.label }), h("td", { class: "n", text: ms(ns).toFixed(2) }),
+      h("td", { class: "n", text: (100 * ns / r.frame_ns).toFixed(0) + "%" })));
+  }
+  b1.append(h("tr", {}, h("td", { text: "of the waits: the waited-for thread was itself stalled" }),
+    h("td", { class: "n", text: ms(r.cause_ns.resolved_inherited || 0).toFixed(2) }), h("td")));
+  b1.append(h("tr", {}, h("td", { text: "of the waits: the waited-for thread was running" }),
+    h("td", { class: "n", text: ms(r.cause_ns.resolved_wait_oncpu || 0).toFixed(2) }), h("td")));
+  t1.append(b1); box.append(t1);
+
+  const t2 = h("table", {}, h("thead", {}, h("tr", {}, h("th", { text: "stall group" }),
+    h("th", { class: "n", text: "ms" }), h("th", { class: "n", text: "waits" }),
+    h("th", { class: "n", text: "longest" }), h("th", { class: "n", text: "stalled" }),
+    h("th", { text: "chain" }))));
+  const b2 = h("tbody");
+  for (const st of r.stalls)
+    b2.append(h("tr", {}, h("td", { text: stallTitle(st) }), h("td", { class: "n", text: ms(st.ns).toFixed(2) }),
+      h("td", { class: "n", text: st.count }), h("td", { class: "n", text: ms(st.longest_ns).toFixed(2) }),
+      h("td", { class: "n", text: ms(taskEnded(st) ? st.inherited_ns : st.ns).toFixed(2) }),
+      h("td", { text: st.other ? "" : st.hops.map((hop, i) =>
+        hopText(hop, i ? st.hops[i - 1].ns : st.longest_ns).join(" ")).join("  ←  ") })));
+  t2.append(b2); box.append(t2);
+
+  for (const st of r.stalls) {
+    if (st.other || (!st.kstack.length && !st.ustack.length)) continue;
+    box.append(h("pre", { text:
+      `${stallTitle(st)} ${fmt(st.ns)}: where the frame's thread was blocked (innermost first)\n` +
+      (st.ustack.length ? "  user:   " + st.ustack.join(" ← ") + "\n" : "") +
+      (st.kstack.length ? "  kernel: " + st.kstack.join(" ← ") : "") }));
+  }
+}
+
+function select(i) {
+  cur = Math.max(0, Math.min(DATA.records.length - 1, i));
+  drawOverview(); drawFrame();
+}
+
+function init() {
+  const m = DATA.meta;
+  document.title = "hitchview: " + m.title;
+  $("title").textContent = m.title;
+  $("subtitle").textContent = `${DATA.records.length} frames over a ${fmt(m.budget_ns)} budget` +
+    (m.frames ? `, of ${m.frames} traced` : "") + `, process ${m.pid}.`;
+  const legend = $("legend");
+  for (const c of CATS)
+    legend.append(h("span", {}, h("span", { class: "sw", style: `background:${color(c.id)}` }),
+      document.createTextNode(c.label)));
+  if (!DATA.records.length) {
+    document.querySelector("main").append(h("p", { text: "No frame went over budget in this run." }));
+    return;
+  }
+  const tb = $("frames");
+  DATA.records.forEach((r, i) => {
+    const tr = h("tr", { "data-i": i }, h("td", { class: "n", text: r.frame_id }),
+      h("td", { class: "n", text: ((r.frame_end_ns - m.t0_ns) / 1e9).toFixed(2) + " s" }),
+      h("td", { class: "n", text: fmt(r.frame_ns) }),
+      h("td", { class: "n", text: fmt(r.frame_ns - r.budget_ns) }),
+      h("td", { text: topStallText(r).replace(/^largest: /, "") }));
+    tr.addEventListener("click", () => select(i));
+    tb.append(tr);
+  });
+  $("prev").addEventListener("click", () => select(cur - 1));
+  $("next").addEventListener("click", () => select(cur + 1));
+  addEventListener("keydown", (ev) => {
+    if (ev.target.closest("input,textarea,select")) return;
+    if (ev.key === "ArrowLeft") select(cur - 1);
+    if (ev.key === "ArrowRight") select(cur + 1);
+  });
+  let pending = 0;
+  addEventListener("resize", () => { cancelAnimationFrame(pending); pending = requestAnimationFrame(() => select(cur)); });
+  /* open on the worst frame */
+  let worst = 0;
+  DATA.records.forEach((r, i) => { if (r.frame_ns > DATA.records[worst].frame_ns) worst = i; });
+  select(m.start != null ? m.start : worst);
+}
+init();
+</script>
+</body>
+</html>
