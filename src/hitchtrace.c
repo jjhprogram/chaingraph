@@ -59,6 +59,7 @@ static struct env {
 	int hops;
 	long duration;
 	bool user_stacks;
+	bool no_timeline;
 	bool quiet;
 	bool verbose;
 } env = {
@@ -79,6 +80,7 @@ enum {
 	OPT_MEDIAN_FACTOR,
 	OPT_MIN_BUDGET,
 	OPT_SHARE,
+	OPT_NO_TIMELINE,
 };
 
 const char *argp_program_version = "hitchtrace 0.1";
@@ -117,6 +119,10 @@ static const struct argp_option opts[] = {
 	  "of its own, and a waker delayed less than this was running "
 	  "(default 100)", 0 },
 	{ "hops", OPT_HOPS, "N", 0, "Chain hops to print, 1-5 (default 5)", 0 },
+	{ "no-timeline", OPT_NO_TIMELINE, NULL, 0,
+	  "Do not log the frame's individual off-CPU intervals. With them, "
+	  "the JSON of a hitch carries every interval of every thread of the "
+	  "process (\"events\")", 0 },
 	{ "budget-mode", OPT_BUDGET_MODE, "fixed|median", 0,
 	  "fixed: -b is the budget. median: the budget follows the app, "
 	  "rolling median of the last 19 frames x --median-factor "
@@ -217,6 +223,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case OPT_HOPS:
 		env.hops = parse_long(arg, 1, HT_MAX_HOPS, state, "hops");
+		break;
+	case OPT_NO_TIMELINE:
+		env.no_timeline = true;
 		break;
 	case ARGP_KEY_ARG:
 		fprintf(stderr, "unrecognized positional argument: %s\n", arg);
@@ -334,7 +343,7 @@ static const char *const hop_flag_names[] = {
 	"preemptor",
 };
 static const char *const frame_flag_names[] = {
-	"open_stall", "no_root_state", "lost", "threads_full",
+	"open_stall", "no_root_state", "lost", "threads_full", "events_full",
 };
 
 /* comm from BPF is a fixed-size field and need not be NUL-terminated */
@@ -1018,7 +1027,13 @@ static void print_record(const struct ht_record *r)
 
 	print_stalls(r);
 	print_threads(r);
-	printf("  %u stall%s this frame\n\n", r->nstalls, r->nstalls == 1 ? "" : "s");
+	printf("  %u stall%s this frame", r->nstalls, r->nstalls == 1 ? "" : "s");
+	/* the intervals themselves are for a viewer: they go to the JSON only */
+	if (r->nevents)
+		printf(", %u off-CPU interval%s of the process logged%s", r->nevents,
+		       r->nevents == 1 ? "" : "s",
+		       env.jsonl ? "" : " (-o FILE to keep them)");
+	printf("\n\n");
 	fflush(stdout);
 }
 
@@ -1233,7 +1248,37 @@ static void json_stall(FILE *f, const struct ht_stall *st, __u32 tgid)
 	fprintf(f, "]}");
 }
 
-static void json_record(FILE *f, const struct ht_record *r)
+/* One logged interval. The stack is given by its blocking point only. */
+static void json_event(FILE *f, const struct ht_event *e)
+{
+	const char *where = e->cause == HT_RUNNABLE ? NULL : blocked_in(e->kstack_id);
+
+	fprintf(f, "{\"tid\":%u,\"out_ns\":%llu,\"wake_ns\":%llu,\"in_ns\":%llu,"
+		"\"cause\":", e->pid, (unsigned long long)e->out_ns,
+		(unsigned long long)e->wake_ns, (unsigned long long)e->in_ns);
+	json_str(f, e->cause < HT_CAUSE_MAX ? cause_names[e->cause] : "unknown");
+	fprintf(f, ",\"flags\":");
+	json_flags(f, e->flags, hop_flag_names,
+		   sizeof(hop_flag_names) / sizeof(hop_flag_names[0]));
+	/* who woke it, or who took its CPU (flag "preemptor") */
+	fprintf(f, ",\"by\":");
+	if (e->by_pid) {
+		fprintf(f, "{\"tid\":%u,\"tgid\":%u,\"comm\":", e->by_pid, e->by_tgid);
+		json_comm(f, e->by_comm);
+		fprintf(f, ",\"stall_ns\":%llu}", (unsigned long long)e->by_stall_ns);
+	} else {
+		fprintf(f, "null");
+	}
+	fprintf(f, ",\"blocked_in\":");
+	if (where)
+		json_str(f, where);
+	else
+		fprintf(f, "null");
+	fputc('}', f);
+}
+
+static void json_record(FILE *f, const struct ht_record *r,
+			const struct ht_events *evs)
 {
 	const struct ht_stall *st[HT_MAX_STALLS];
 	__u32 nst = rank_stalls(r, st);
@@ -1298,6 +1343,19 @@ static void json_record(FILE *f, const struct ht_record *r)
 			fputc(']', f);
 	}
 
+	/*
+	 * The frame's timeline: every off-CPU interval of every thread of the
+	 * process, in the order they ended. Absent with --no-timeline.
+	 */
+	if (evs) {
+		fprintf(f, ",\"events_dropped\":%u,\"events\":[", evs->dropped);
+		for (__u32 i = 0; i < evs->n; i++) {
+			fprintf(f, "%s", i ? "," : "");
+			json_event(f, &evs->ev[i]);
+		}
+		fputc(']', f);
+	}
+
 	fprintf(f, "}\n");
 	fflush(f);
 }
@@ -1307,20 +1365,71 @@ static void json_record(FILE *f, const struct ht_record *r)
 static unsigned long long nrecords;
 static unsigned long long nshort;
 
+/*
+ * A frame's intervals arrive as their own item right after its record. Hold
+ * a record that announces some until they come, or until something else does.
+ */
+static struct ht_record *held;
+static bool have_held;
+
+static void emit(const struct ht_record *r, const struct ht_events *evs)
+{
+	nrecords++;
+	if (!env.quiet)
+		print_record(r);
+	if (jsonl)
+		json_record(jsonl, r, evs);
+}
+
+static void flush_held(void)
+{
+	if (have_held)
+		emit(held, NULL);
+	have_held = false;
+}
+
 static int handle_event(void *ctx, void *data, size_t size)
 {
 	const struct ht_record *r = data;
 
 	(void)ctx;
-	if (size < sizeof(*r)) {
+	if (size < sizeof(__u32)) {
 		nshort++;
 		return 0;
 	}
-	nrecords++;
-	if (!env.quiet)
-		print_record(r);
-	if (jsonl)
-		json_record(jsonl, r);
+	if (*(const __u32 *)data == HT_KIND_EVENTS) {
+		const struct ht_events *evs = data;
+		size_t head = offsetof(struct ht_events, ev);
+
+		if (size < head || evs->n > HT_MAX_EVENTS ||
+		    size < head + (size_t)evs->n * sizeof(evs->ev[0])) {
+			nshort++;
+			flush_held();
+			return 0;
+		}
+		if (have_held && held->frame_id == evs->frame_id) {
+			emit(held, evs);
+			have_held = false;
+		}
+		return 0;
+	}
+	if (r->kind != HT_KIND_RECORD || size < sizeof(*r)) {
+		nshort++;
+		return 0;
+	}
+	flush_held();		/* its intervals never came */
+	if (!r->nevents) {
+		emit(r, NULL);
+		return 0;
+	}
+	if (!held)
+		held = malloc(sizeof(*held));
+	if (!held) {
+		emit(r, NULL);
+		return 0;
+	}
+	memcpy(held, r, sizeof(*held));
+	have_held = true;
 	return 0;
 }
 
@@ -1502,6 +1611,7 @@ static struct hitchtrace_bpf *open_and_load(bool with_irq_hooks, int *errp)
 	obj->rodata->max_hops = env.hops;
 	obj->rodata->kernel_stacks = true;
 	obj->rodata->user_stacks = env.user_stacks;
+	obj->rodata->timeline = !env.no_timeline;
 
 	/* the marker uprobe needs a binary and a pid, so it is attached by hand */
 	bpf_program__set_autoattach(obj->progs.on_frame_mark, false);
@@ -1771,6 +1881,7 @@ int main(int argc, char **argv)
 	bpf_link__destroy(present_link);
 	present_link = NULL;
 	ring_buffer__consume(rb);
+	flush_held();
 	hitchtrace_bpf__detach(obj);
 	for (size_t i = 0; i < sizeof(irq_hooks) / sizeof(irq_hooks[0]); i++) {
 		bpf_link__destroy(irq_hooks[i].enter_link);

@@ -14,7 +14,11 @@
  * inherited from the waker, and the rest is the waker running on-CPU
  * ("waiting for work", not a kernel stall).
  *
- * Records cross to user space only for frames over budget.
+ * Records cross to user space only for frames over budget. With the
+ * timeline on, such a record is followed by the frame's raw off-CPU
+ * intervals, one struct ht_event per interval of every thread of the process:
+ * they are logged as they happen into a buffer that a frame within budget
+ * simply discards.
  *
  * Types shared between the BPF program and the userspace front end.
  */
@@ -24,6 +28,11 @@
 #define TASK_COMM_LEN		16
 #define HT_MAX_HOPS		5	/* chain hops kept per stall group */
 #define HT_MAX_STALLS		8	/* stall groups per frame; the last is the rest */
+#define HT_MAX_EVENTS		2048	/* off-CPU intervals logged per frame */
+
+/* What a ring buffer item is: the first word of every one. */
+#define HT_KIND_RECORD		1	/* struct ht_record */
+#define HT_KIND_EVENTS		2	/* struct ht_events, right after its record */
 #define HT_PERF_MAX_STACK	32	/* frames per kernel stack */
 #define HT_MAX_THREADS		32	/* per-thread detail slots in a record */
 #define HT_MEDIAN_WINDOW	19	/* frames behind the rolling-median budget */
@@ -88,6 +97,7 @@ enum ht_sysclass {
 #define HT_FRAME_NO_ROOT_STATE	(1U << 1)	/* root state was created mid-frame */
 #define HT_FRAME_LOST		(1U << 2)	/* some accounting was dropped */
 #define HT_FRAME_THREADS_FULL	(1U << 3)	/* more threads than HT_MAX_THREADS */
+#define HT_FRAME_EVENTS_FULL	(1U << 4)	/* more intervals than HT_MAX_EVENTS */
 
 /* ht_thread.flags */
 #define HT_THREAD_ROOT		(1U << 0)	/* this is the frame's root thread */
@@ -161,8 +171,42 @@ struct ht_thread {
 	__u64 preemptor_ns;
 };
 
+/*
+ * One off-CPU interval of one thread of the process: it left the CPU at
+ * out_ns, was woken at wake_ns and ran again at in_ns, so [out, wake) is the
+ * wait and [wake, in) the time queued for a CPU. A preempted thread was never
+ * asleep: wake_ns == in_ns and the whole of it is runnable time. Times are
+ * not clipped to the frame; an interval that began before it says so.
+ */
+struct ht_event {
+	__u64 out_ns;
+	__u64 wake_ns;
+	__u64 in_ns;
+	__u64 by_stall_ns;	/* of the wait: the waker was itself off-CPU */
+	__u32 pid;		/* the thread */
+	__u32 cause;		/* enum ht_cause of [out, wake) */
+	__u32 by_pid;		/* who woke it, or who preempted it (HT_HOP_PREEMPTOR);
+				 * 0 = an interrupt, or nobody on record */
+	__u32 by_tgid;
+	__u32 flags;		/* HT_HOP_*: how the wait ended */
+	__s32 kstack_id;	/* where it blocked */
+	char by_comm[TASK_COMM_LEN];
+};
+
+/* A frame's intervals, in the order they ended. Sent n events long. */
+struct ht_events {
+	__u32 kind;		/* HT_KIND_EVENTS */
+	__u32 n;		/* valid entries in ev[] */
+	__u64 frame_id;
+	__u32 dropped;		/* intervals beyond HT_MAX_EVENTS */
+	__u32 __pad;
+	struct ht_event ev[HT_MAX_EVENTS];
+};
+
 /* One over-budget frame. */
 struct ht_record {
+	__u32 kind;		/* HT_KIND_RECORD */
+	__u32 nevents;		/* intervals sent right after this record */
 	__u64 frame_id;
 	__u64 frame_start_ns;
 	__u64 frame_end_ns;

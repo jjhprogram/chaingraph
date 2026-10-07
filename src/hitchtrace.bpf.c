@@ -25,6 +25,10 @@
 
 #define EEXIST		17
 
+#ifndef offsetof
+#define offsetof(type, member)	__builtin_offsetof(type, member)
+#endif
+
 #define TASK_RUNNING	0x0000
 #define TASK_DEAD	0x0080
 #define PF_USER_WORKER	0x00004000
@@ -69,6 +73,8 @@ const volatile bool kernel_stacks = true;
  */
 bool have_present_marker = false;
 const volatile bool user_stacks = false;
+/* log every off-CPU interval of the open frame, to send with a hitch record */
+const volatile bool timeline = true;
 
 /*
  * What we knew about a waker when it issued the wakeup: how long it had itself
@@ -229,6 +235,26 @@ struct {
 	__type(key, __u32);
 	__type(value, struct stall_table);
 } root_stalls SEC(".maps");
+
+/*
+ * The open frame's off-CPU intervals, logged as they end and sent only if the
+ * frame turns out over budget. Threads on several CPUs append at once, each
+ * claiming its entry with an atomic increment of ->next. There are two
+ * buffers and the frame's epoch picks one, so that the frame mark can send
+ * the frame that just closed while the next one is already being logged.
+ */
+struct event_buf {
+	__u32 next;		/* entries claimed; may run past HT_MAX_EVENTS */
+	__u32 __pad;
+	struct ht_events out;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 2);
+	__type(key, __u32);
+	__type(value, struct event_buf);
+} event_bufs SEC(".maps");
 
 /*
  * Per-thread detail for the open frame. Each thread writes its own slot as it
@@ -520,6 +546,31 @@ static __always_inline struct frame_ctx *frame_ctx(void)
 	__u32 zero = 0;
 
 	return bpf_map_lookup_elem(&frame_state, &zero);
+}
+
+#define READ_ONCE(x)	(*(volatile typeof(x) *)&(x))
+
+/*
+ * The open frame's start and epoch, as a pair. The frame mark writes the
+ * start and then bumps the epoch, on the root's CPU, while threads switching
+ * in elsewhere read both; a thread the root wakes on its way into present
+ * does so at every frame boundary. Read both once and re-read if the epoch
+ * moved, so that an interval is clipped to the start of the same frame whose
+ * slot and event buffer it goes to. Returns false while no frame is open.
+ */
+static __always_inline bool frame_window(struct frame_ctx *fc, __u64 *start,
+					 __u32 *epoch)
+{
+	__u32 e = READ_ONCE(fc->epoch);
+	__u64 s = READ_ONCE(fc->frame_start);
+
+	if (READ_ONCE(fc->epoch) != e) {
+		e = READ_ONCE(fc->epoch);
+		s = READ_ONCE(fc->frame_start);
+	}
+	*start = s;
+	*epoch = e;
+	return s != 0;
 }
 
 /* This thread's slot for @epoch, zeroed if it still holds an older frame. */
@@ -1196,6 +1247,57 @@ static __always_inline void account_runqueue(struct stall_table *tbl, __u64 lo,
 	w->nhops = 0;
 }
 
+/*
+ * Log one finished off-CPU interval of a thread of the process: [lo, hi)
+ * waiting, then queued until @now.
+ */
+static __always_inline void log_event(__u32 epoch, struct task_struct *t,
+				      struct task_state *ts, __u64 lo, __u64 hi,
+				      __u64 now, __u32 cause, bool resolvable)
+{
+	__u32 key = epoch & 1, idx;
+	struct event_buf *b;
+	struct ht_event *e;
+
+	b = bpf_map_lookup_elem(&event_bufs, &key);
+	if (!b)
+		return;
+	idx = __sync_fetch_and_add(&b->next, 1);
+	if (idx >= HT_MAX_EVENTS)
+		return;		/* the frame mark reports how many were lost */
+	e = &b->out.ev[idx];
+	e->out_ns = lo;
+	e->wake_ns = hi;
+	e->in_ns = now;
+	e->pid = t->pid;
+	e->cause = cause;
+	e->kstack_id = ts->out_kstack;
+	e->by_stall_ns = 0;
+	if (cause == HT_RUNNABLE) {
+		e->by_pid = ts->preempt_pid;
+		e->by_tgid = ts->preempt_tgid;
+		e->flags = HT_HOP_PREEMPTOR;
+		__builtin_memcpy(e->by_comm, ts->preempt_comm, TASK_COMM_LEN);
+	} else if (ts->wake_ts) {
+		struct hop_link *l = &ts->links[0];
+
+		e->by_pid = l->pid;
+		e->by_tgid = l->tgid;
+		e->flags = l->flags;
+		__builtin_memcpy(e->by_comm, l->comm, TASK_COMM_LEN);
+		if (resolvable) {
+			__u64 stall = l->sched_ns + l->blocked_ns;
+
+			e->by_stall_ns = stall < hi - lo ? stall : hi - lo;
+		}
+	} else {
+		e->by_pid = 0;
+		e->by_tgid = 0;
+		e->flags = 0;
+		__builtin_memset(e->by_comm, 0, TASK_COMM_LEN);
+	}
+}
+
 SEC("tp_btf/sched_switch")
 int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
 	     struct task_struct *next, unsigned int prev_state)
@@ -1219,16 +1321,18 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
 					  clip(ts->in_ts, now, ts->frame_start));
 			if (track_prev) {
 				struct frame_ctx *fc = frame_ctx();
+				__u64 fstart;
+				__u32 fepoch;
 
-				if (fc && fc->frame_start) {
+				if (fc && frame_window(fc, &fstart, &fepoch)) {
 					struct thread_slot *sl =
-						slot_of(ts, prev, fc->epoch);
+						slot_of(ts, prev, fepoch);
 
 					if (sl) {
 						if (ts->in_ts)
 							sl->th.cause_ns[HT_ONCPU] +=
 								clip(ts->in_ts, now,
-								     fc->frame_start);
+								     fstart);
 						/* split off the on-CPU kernel stalls
 						 * taken since the last update */
 						carve(sl->th.cause_ns,
@@ -1305,13 +1409,19 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev,
 
 	if (track_next) {
 		struct frame_ctx *fc = frame_ctx();
+		__u64 fstart;
+		__u32 fepoch;
 
-		if (fc && fc->frame_start) {
-			struct thread_slot *sl = slot_of(ts, next, fc->epoch);
+		if (fc && frame_window(fc, &fstart, &fepoch)) {
+			struct thread_slot *sl = slot_of(ts, next, fepoch);
+
+			if (timeline && now > fstart)
+				log_event(fepoch, next, ts, lo, hi, now, cause,
+					  resolvable);
 
 			if (sl) {
-				__u64 b = clip(lo, hi, fc->frame_start);
-				__u64 rq = clip(hi, now, fc->frame_start);
+				__u64 b = clip(lo, hi, fstart);
+				__u64 rq = clip(hi, now, fstart);
 
 				if (cause < HT_CAUSE_PARTITION)
 					sl->th.cause_ns[cause] += b;
@@ -1370,10 +1480,12 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 	struct task_struct *cur = bpf_get_current_task_btf();
 	__u64 now = bpf_ktime_get_ns(), frame_ns;
 	struct frame_ctx *fc = frame_ctx();
+	struct event_buf *evb = NULL;
 	struct stall_table *tbl;
 	struct task_state *ts;
 	struct ht_record *rec;
 	__u64 eff_budget, stall_ns;
+	__u32 nevents = 0, ndropped = 0;
 	__u32 i;
 	bool over;
 
@@ -1446,6 +1558,7 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 			if (!rec) {
 				stat_inc(HT_STAT_RINGBUF_FULL);
 			} else {
+				rec->kind = HT_KIND_RECORD;
 				rec->frame_id = frame_id;
 				rec->frame_start_ns = ts->frame_start;
 				rec->frame_end_ns = now;
@@ -1566,6 +1679,39 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 					if (used && *used > HT_MAX_THREADS)
 						rec->flags |= HT_FRAME_THREADS_FULL;
 				}
+				/*
+				 * The frame's intervals, as one item as long as
+				 * there are intervals. Sent last, after the
+				 * walk above: a thread whose wait ends while
+				 * this program runs (one the root woke on its
+				 * way into present, every frame) is then in
+				 * both or in neither. The record was reserved
+				 * first, so the reader gets it first and holds
+				 * it until this arrives.
+				 */
+				if (timeline && fc) {
+					__u32 key = fc->epoch & 1;
+
+					evb = bpf_map_lookup_elem(&event_bufs, &key);
+				}
+				if (evb) {
+					nevents = evb->next;
+					if (nevents > HT_MAX_EVENTS) {
+						ndropped = nevents - HT_MAX_EVENTS;
+						nevents = HT_MAX_EVENTS;
+						rec->flags |= HT_FRAME_EVENTS_FULL;
+					}
+					evb->out.kind = HT_KIND_EVENTS;
+					evb->out.n = nevents;
+					evb->out.frame_id = frame_id;
+					evb->out.dropped = ndropped;
+					if (bpf_ringbuf_output(&events, &evb->out,
+							       offsetof(struct ht_events, ev) +
+							       nevents * sizeof(struct ht_event),
+							       0))
+						nevents = 0;
+				}
+				rec->nevents = nevents;
 				bpf_ringbuf_submit(rec, 0);
 				stat_inc(HT_STAT_EMITTED);
 			}
@@ -1580,7 +1726,18 @@ int BPF_UPROBE(on_frame_mark, unsigned long frame_id)
 	if (have_present_marker)
 		ts->in_present = 1;
 
-	/* open the next frame, and publish it to the other threads */
+	/*
+	 * Open the next frame, and publish it to the other threads. Its
+	 * intervals go to the other buffer, emptied here while nobody is
+	 * writing to it.
+	 */
+	if (fc && timeline) {
+		__u32 key = (fc->epoch + 1) & 1;
+
+		evb = bpf_map_lookup_elem(&event_bufs, &key);
+		if (evb)
+			evb->next = 0;
+	}
 	if (fc) {
 		fc->frame_start = now;
 		fc->frame_id = frame_id;
