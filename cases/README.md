@@ -11,7 +11,7 @@ around one unmodified workload, and asks whether a hitchtrace record alone expla
   (`frames.jsonl`), which is what an engine's built-in profiler would show.
 - **The environment** supplies the cause. `bgload.c` is a background application that wakes
   periodically and burns CPU. It logs every burst, and that log is the ground truth.
-  `bgio.c` is its disk counterpart (not used in a case yet; see case 2).
+  `bgio.c` is its disk counterpart: it reads or writes a scratch file in bursts (case 2b).
 - **`run.sh VARIANT [SECONDS] [RUN_NAME]`** runs the game on CPUs 0–3, attaches hitchtrace through the
   Vulkan layer, and writes everything to `out/RUN_NAME/`.
 
@@ -57,6 +57,7 @@ woken, when it ran again, why it waited, and who woke or preempted it.
 |---|---|---|---|---|---|
 | 1 `bgcpu` | a background app takes the game's cores | 99% | 100% of the worker's delay | on top (one long wait) | names only the last preemptor |
 | 2 `iomain`, `iothread` | a frame waits on a disk read | 100% | 91–94% | 66–71% / 81–88% | why the disk was slow |
+| 2b `iodisk` | another program reads from the same slow disk | 100% | 99% | 94% / 100% | **who else was using the disk** |
 | 3 `mem`, `memthp` | walking memory that was swapped out | 99–100% | 95–96% | 33–60% / 99–100% | which pressure caused the swapping |
 | 4 `slack` | the frame limiter's sleep ends late | sees the sleep | 99% | 0% | **that the sleep was late** |
 | 5 `ipc` | calls to a server that cannot get its CPU | 100% | 105% | 8% / 98% | **who had the server's CPU** |
@@ -262,12 +263,11 @@ The pack is read with `O_DIRECT`. A real game does not do that; it stands in for
 yet in the page cache, without needing root to drop caches. Ground truth is the game's own frame log:
 which frames loaded an asset and how long the game spent on it.
 
-**What could not be reproduced here.** The documented case (C1) is a *download* saturating the disk.
+**Contention needs a throttled disk.** The documented case (C1) is a *download* saturating the disk.
 On this VM a background writer (`bgio`, 8 threads writing 1 MB blocks with `O_DIRECT`) made no
 reliable difference: an 8 MB load took a median 7.3 ms without it and 8.7 ms during its bursts, inside
-the run-to-run spread. The virtual disk sits on fast host storage, and the I/O controller is not
-delegated to an unprivileged user, so the disk cannot be throttled either. Slow or contended storage
-needs bare metal or root (`dm-delay`, `io.max`). What is reproduced is the wait itself.
+the run-to-run spread. The virtual disk sits on fast host storage. These two variants therefore
+reproduce the wait itself; the contended disk is `iodisk`, below, which needs a one-time root step.
 
 **Result** (60 s each, `HITCHTRACE_ARGS=-U`, hitchtrace at 4ca8a3b):
 
@@ -350,12 +350,128 @@ workers are both futex waits; the baseline has to be per group. The same baselin
   was already I/O. Grouping matters when no single wait stands out, as in `thousand_cuts`.
 - **The chain ends at the device interrupt.** hitchtrace says the thread waited on storage and for how
   long. It cannot say why the storage was slow or who else was using it, which is exactly what the
-  download case (C1) would need.
+  download case (C1) needs. `iodisk` below confirms it.
 - **No measurable tracing overhead on the load**: interleaved A/B, 3 × 12 s per arm, 48 loads each:
   a median 7.8 ms untraced, 8.7 ms traced, 9.1 ms traced with `-U`, with a 90th percentile of 18–19 ms
   in all three. The 14–16 ms medians in the two case runs are this VM's disk being slower at the time.
 - A waker delayed 0.2 ms in an 8.4 ms wait is printed as "kept off the CPU 0.2 ms". True, but the
   wording gives it more weight than the 8.2 ms it spent running.
+
+## Case 2b: another program is reading from the same slow disk (`iodisk`)
+
+**What it models.** `cases.md` C1: a launcher downloads or verifies files while the game streams
+assets from the same disk. Every 15th frame the game asks its streaming thread for a 2 MB asset and
+waits, as in `iothread`. Next to it `bgio -R` reads a large file with 4 threads, in 400 ms bursts
+every 1.5 s, pinned to CPUs 6–9 so it never takes the game's cores. The two share nothing but the
+disk.
+
+The VM's disk is too fast for the reader to matter, so the disk is made slow: the game and the reader
+run in one cgroup (`hitchdisk.slice`) whose reads from that disk are capped at 200 MB/s
+(`IOReadBandwidthMax`). That is a slow disk with one budget for both: while the reader is idle the
+game has all of it, and during a burst the reader's four threads take most of it. Ground truth is two
+logs that hitchtrace never sees: the game's (which frames loaded, and how long the load took) and the
+reader's (when it was reading).
+
+The cap needs the I/O controller delegated to the user's systemd, once, as root:
+
+```
+sudo mkdir -p /etc/systemd/system/user@.service.d
+printf '[Service]\nDelegate=cpu cpuset io memory pids\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+sudo systemctl daemon-reload && systemctl --user daemon-reexec
+```
+
+`run.sh iodisk` refuses to run without it. `DISK_BPS=none` runs the same thing with no cap.
+
+**Result** (60 s, `HITCHTRACE_ARGS=-U`, hitchtrace at 2fef08b, 3,290 frames):
+
+| The game's own log | Loads with the reader idle | Loads during a reader burst |
+|---|---|---|
+| Frames | 162 | 58 |
+| Load time, median | 2.2 ms | **57.3 ms** |
+| Over budget | 23 (14%) | 54 (93%) |
+
+The same 2 MB read is 26 times slower while the other program reads. Scoring each over-budget record:
+
+| From one record | Loads during a burst (54) | Noise (83) |
+|---|---|---|
+| Some group reads "waited for `mg_stream`, which was blocked on I/O, ended by an interrupt" | **54 (100%)** | 22 (quiet loads) |
+| The streamer's I/O in the chain / the game's own load time, median | **99%** | 97% |
+| That group is top-ranked by total | 51 (94%) | 7 |
+| … by stall time | 54 (100%) | 20 |
+| **Anything in the record names `bgio`** | **0 (0%)** | 0 |
+
+The 22 noise records with an I/O group are loads made while the reader was idle. They are short (about
+2 ms), correctly reported, and mostly not on top. A typical record from a burst:
+
+```
+hitch frame 2144  86.2 ms  (budget 20.8 ms, over by 65.4 ms)  root mg_main
+  blocked   85.4 ms  futex 82.2 | timer 2.8 | present 0.3
+  resolved   waiting on a running task 19.4 ms, inherited stalls 63.1 ms
+  stalls     off-CPU time by cause and by who ended it, largest first
+     63.7 ms  futex    blocked in __futex_wait
+              <- mg_stream         blocked 63.1 ms in blk_io_schedule
+                <- [softirq]       woken from a softirq
+     18.5 ms  futex    blocked in __futex_wait
+              <- mg_worker2        was running (waiting for work) 0.0 ms
+    mg_stream    oncpu 0.6  blocked 66.3  futex 3.4 | io 63.0   largest 61.9 ms in blk_io_schedule
+```
+
+**What the record gives.** "This frame was 65 ms late because the streaming thread waited 63 ms for
+the disk, in two waits." That is complete and correct, and it settles the first question a developer
+has: the game did nothing unusual, the storage answered slowly. With `-U` the game's own stack says
+which load it was.
+
+**What it cannot give: the other program.** Nothing in any of the 54 records mentions `bgio`, and
+nothing can. A wakeup chain follows who woke whom, and the streamer was woken by the disk's
+completion interrupt. The reader never woke or preempted any thread of the game; it took the disk's
+time by having its own requests served first. The competition happens inside the kernel's block
+layer (the part that queues read and write requests for a device), which hitchtrace does not watch.
+The record for a slow disk and the record for a busy disk are the same record.
+
+A developer could still infer it: 2 MB in 63 ms is 32 MB/s, far below what the disk does when idle.
+But hitchtrace does not record the size of the read, and the same load reported 2 ms a second earlier
+lives in a different record, or in none if that frame was on time.
+
+What would close the gap is block-layer data taken only while a target thread is waiting on I/O: how
+long its request sat queued before the device started it, against how long the device took, and which
+other processes had requests issued or completed in that window. The kernel has tracepoints for each
+step (`block_rq_insert`, `block_rq_issue`, `block_rq_complete`). On this setup one more caveat
+applies: the cap delays requests in the cgroup throttle, before they reach the device queue, so the
+queued-versus-served split would have to count that stage as well.
+
+**A second effect: the frames after a long load are slow too.** The game's log shows the workers' job
+phase, usually 13.7 ms, taking longer in the frame that waited and in the ones after it, and the more
+so the longer the wait was:
+
+| Load took | Loads | Job phase, same frame | Next frame | The one after | Next frame over budget |
+|---|---|---|---|---|---|
+| under 5 ms | 151 | 13.6 ms | 14.0 | 13.4 | 1% |
+| 5–20 ms | 11 | 15.4 | 15.3 | 14.2 | 0% |
+| 20–45 ms | 23 | 19.8 | 18.4 | 16.7 | 26% |
+| 45–70 ms | 25 | 24.1 | 20.9 | 17.0 | 60% |
+| over 70 ms | 10 | 24.3 | 21.4 | 19.9 | 60% |
+
+So one slow load costs two or three hitches, not one. The reader's bursts alone do not slow the
+workers: frames with no load have the same 13.8 ms job phase inside and outside a burst. What the
+records of those following frames (26 of them) say: no I/O at all, a 23 ms wait on the workers, and
+the three workers on the CPU for 60 ms between them where a normal frame needs about 41 ms. They were
+not queued (4 ms runnable in total). They ran the same work 50% slower. The likely reason is that the
+cores sat idle for the length of the load and came back slow (lower clock speed, or the host having
+parked the virtual CPUs), but that is not verified: nothing inside the VM shows it.
+
+For hitchtrace this is the `cpuspike` blind spot again. The record says "the workers were running"
+and blames no stall, which is true, but it has no way to say they ran slower than usual, and nothing
+links the follow-on hitch to the load one frame earlier. In the viewer's overview strip the pattern
+is visible to a person: a high dot followed closely by one or two just over the budget line.
+
+**Other observations.**
+
+- **Ranking is not the problem here** (94% by total). The load is long enough to outweigh the frame's
+  normal waits; the three misses are loads of 11–16 ms.
+- **The timeline agrees with the buckets**: `check_timeline.py` finds 1 thread line in 1,104 off by
+  more than 50 µs (77 µs of run-queue time on a helper thread).
+- The interrupt that ends the chain is reported the same way whether the wait was in the device or in
+  the cgroup throttle, so the record does not show that a throttle was involved.
 
 ## Case 3: walking memory that was swapped out (`mem`, `memthp`)
 

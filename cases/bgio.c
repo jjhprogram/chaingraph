@@ -6,6 +6,8 @@
  * mostly idle, and every PERIOD it spends BURST writing BLOCK-sized blocks
  * to a scratch file from THREADS threads at once, bypassing the page cache
  * so that every write is a request to the device, queued with the game's.
+ * With -R it reads instead: a launcher verifying files, or anything else
+ * that competes for the same read throughput.
  *
  * Every burst is logged as [start, end] on CLOCK_MONOTONIC (the clock behind
  * bpf_ktime_get_ns()), so a case study can tell afterwards which frames a
@@ -14,8 +16,8 @@
  * The scratch file must exist and be fully written beforehand, so that a
  * burst overwrites blocks instead of allocating them.
  *
- * usage: bgio -f FILE [-t THREADS] [-p PERIOD_MS] [-b BURST_MS] [-k BLOCK_KB]
- *             [-d SECONDS] [-o LOG]
+ * usage: bgio -f FILE [-R] [-t THREADS] [-p PERIOD_MS] [-b BURST_MS]
+ *             [-k BLOCK_KB] [-d SECONDS] [-o LOG]
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -36,6 +38,7 @@
 static int opt_threads = 8, opt_period_ms = 1500, opt_burst_ms = 300;
 static int opt_block_kb = 1024, opt_duration = 20;
 static const char *opt_file, *opt_log;
+static int opt_read;
 static uint64_t t_start, t_stop;
 static off_t file_blocks;
 static volatile sig_atomic_t stop;
@@ -84,7 +87,7 @@ static void *writer(void *arg)
 
 	snprintf(name, sizeof(name), "bgio%ld", id);
 	pthread_setname_np(pthread_self(), name);
-	fd = open(opt_file, O_WRONLY | O_DIRECT);
+	fd = open(opt_file, (opt_read ? O_RDONLY : O_WRONLY) | O_DIRECT);
 	if (fd < 0 || posix_memalign((void **)&buf, 4096, block)) {
 		fprintf(stderr, "bgio: %s: %s\n", opt_file, strerror(errno));
 		exit(1);
@@ -102,9 +105,12 @@ static void *writer(void *arg)
 			rng ^= rng << 13;
 			rng ^= rng >> 17;
 			rng ^= rng << 5;
-			if (pwrite(fd, buf, block,
-				   (off_t)(rng % file_blocks) * block) < 0) {
-				fprintf(stderr, "bgio: write: %s\n", strerror(errno));
+			off_t off = (off_t)(rng % file_blocks) * block;
+
+			if ((opt_read ? pread(fd, buf, block, off)
+				      : pwrite(fd, buf, block, off)) < 0) {
+				fprintf(stderr, "bgio: %s: %s\n",
+					opt_read ? "read" : "write", strerror(errno));
 				exit(1);
 			}
 			t = now_ns();
@@ -130,9 +136,10 @@ int main(int argc, char **argv)
 	long i;
 	int c;
 
-	while ((c = getopt(argc, argv, "f:t:p:b:k:d:o:h")) != -1) {
+	while ((c = getopt(argc, argv, "f:Rt:p:b:k:d:o:h")) != -1) {
 		switch (c) {
 		case 'f': opt_file = optarg; break;
+		case 'R': opt_read = 1; break;
 		case 't': opt_threads = atoi(optarg); break;
 		case 'p': opt_period_ms = atoi(optarg); break;
 		case 'b': opt_burst_ms = atoi(optarg); break;
@@ -140,8 +147,9 @@ int main(int argc, char **argv)
 		case 'd': opt_duration = atoi(optarg); break;
 		case 'o': opt_log = optarg; break;
 		default:
-			fprintf(stderr, "usage: bgio -f FILE [-t THREADS] [-p PERIOD_MS] "
-				"[-b BURST_MS] [-k BLOCK_KB] [-d SECONDS] [-o LOG]\n");
+			fprintf(stderr, "usage: bgio -f FILE [-R] [-t THREADS] "
+				"[-p PERIOD_MS] [-b BURST_MS] [-k BLOCK_KB] "
+				"[-d SECONDS] [-o LOG]\n");
 			return 2;
 		}
 	}

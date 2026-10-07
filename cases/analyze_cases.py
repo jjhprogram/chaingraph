@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
-"""Score a `cases/run.sh mem|memthp|slack|ipc|cpuspike` run.
+"""Score a `cases/run.sh mem|memthp|slack|ipc|cpuspike|iodisk` run.
 
 Does a hitchtrace record alone explain the hitch? Each over-budget record is
 set against ground truth that does not come from hitchtrace, and sorted into
@@ -20,6 +20,10 @@ good tool answers the case's questions yes on the first and no on the second.
   cpuspike      affected: the frame burned CPU on the main thread (the game's
                 log). A negative control: does the record show the time as
                 running, and blame no stall?
+  iodisk        affected: the frame loaded an asset (the game's log) while
+                bgio was reading from the same limited disk (its log). Does
+                the record show the wait on the streamer, that the streamer
+                was on I/O, and does anything in it name bgio?
 
 Rankings other than the record's own (by total) are replayed on the same
 records: the old rule (longest single wait), and "stall time" (a wait on a
@@ -84,6 +88,21 @@ def is_fault_io(stall):
             and any(f in FAULT_FRAMES for f in stall["kstack"]))
 
 
+def from_stream(stall):
+    return bool(stall["hops"]) and stall["hops"][0]["comm"] == "mg_stream"
+
+
+def names(rec, prefix):
+    """Does any thread name anywhere in the record start with @prefix?"""
+    seen = [t["comm"] for t in rec["threads"]]
+    seen += [(t.get("preemptor") or {}).get("comm", "") for t in rec["threads"]]
+    for s in rec["stalls"]:
+        for h in s["hops"]:
+            seen += [h["comm"], (h.get("preemptor") or {}).get("comm", "")]
+    seen += [(e.get("by") or {}).get("comm", "") for e in rec.get("events") or []]
+    return any(c.startswith(prefix) for c in seen)
+
+
 def from_server(stall):
     return bool(stall["hops"]) and stall["hops"][0]["comm"] == "mg_server"
 
@@ -97,7 +116,8 @@ def main():
     manifest = json.load(open(f"{run}/manifest.json"))
     variant = manifest["variant"]
     budget_us = hdr["budget_ns"] / 1e3
-    bursts = load(f"{run}/bursts.jsonl") if variant in ("slack", "ipc") else []
+    bursts = (load(f"{run}/bursts.jsonl")
+              if variant in ("slack", "ipc", "iodisk") else [])
 
     def overlap(s, e):
         return sum(max(0, min(e, b["end_ns"]) - max(s, b["start_ns"])) for b in bursts)
@@ -108,15 +128,19 @@ def main():
            if f["t_end_ns"] - f["frame_us"] * 1000 > lo and f["t_end_ns"] < hi]
 
     def affected(f):
+        hit = overlap(f["t_end_ns"] - f["frame_us"] * 1000,
+                      f["t_end_ns"]) >= MIN_OVERLAP_NS
         if variant in ("slack", "ipc"):
-            return overlap(f["t_end_ns"] - f["frame_us"] * 1000,
-                           f["t_end_ns"]) >= MIN_OVERLAP_NS
+            return hit
+        if variant == "iodisk":
+            return bool(f["asset"]) and hit
         return bool(f["step"])
 
     aff = [f for f in win if affected(f)]
     quiet = [f for f in win if not affected(f)]
     phase = {"mem": "touch_us", "memthp": "touch_us", "slack": "late_us",
-             "ipc": "calls_us", "cpuspike": "burn_us"}[variant]
+             "ipc": "calls_us", "cpuspike": "burn_us",
+             "iodisk": "asset_us"}[variant]
     print(f"run {run} ({variant}): {len(win)} frames traced")
     print("\nThe game's own log (frames.jsonl), median per frame:")
     for name, fs in (("other frames", quiet), ("affected frames", aff)):
@@ -127,6 +151,27 @@ def main():
                      f"{med(f['minflt'] for f in fs):.0f} minor faults")
         print(f"  {name:16}{len(fs):>6} frames, {pct(over, len(fs)):>13} over budget, "
               f"{phase[:-3]} {med(f[phase] for f in fs) / 1e3:.1f} ms{extra}")
+    if variant == "iodisk":
+        calm = [f for f in quiet if f["asset"]]
+        over = sum(f["frame_us"] > budget_us for f in calm)
+        print(f"  of the others, loads with bgio idle: {len(calm)} frames, "
+              f"{pct(over, len(calm))} over budget, asset "
+              f"{med(f['asset_us'] for f in calm) / 1e3:.1f} ms")
+        # the workers sit idle while the frame waits for the load; how long
+        # does their job phase take then, and in the frames after?
+        at = {id(f): i for i, f in enumerate(win)}
+        print(f"  job phase by how long the load took "
+              f"(usual {med(f['jobs_us'] for f in win if not f['asset']) / 1e3:.1f} ms):")
+        for a, b in ((0, 5), (5, 20), (20, 45), (45, 70), (70, 1e9)):
+            ids = [at[id(f)] for f in win
+                   if f["asset"] and a <= f["asset_us"] / 1e3 < b and at[id(f)] + 2 < len(win)]
+            if len(ids) < 5:
+                continue
+            name = f"{a}-{b} ms" if b < 1e9 else f"over {a} ms"
+            row = [med(win[i + d]["jobs_us"] for i in ids) / 1e3 for d in (0, 1, 2)]
+            late = sum(win[i + 1]["frame_us"] > budget_us for i in ids)
+            print(f"    load {name:11}{len(ids):>4} loads: same frame {row[0]:.1f} ms, next "
+                  f"{row[1]:.1f}, the one after {row[2]:.1f}; next frame over budget {pct(late, len(ids))}")
     usual = med(f[phase] for f in quiet) * 1000		# ns, a usual frame's worth
 
     by_end = sorted(win, key=lambda f: f["t_end_ns"])
@@ -201,6 +246,18 @@ def main():
                     counts.append(srv[0]["count"])
                     if game_ns > usual:
                         amounts.append(srv[0]["inherited_ns"] / (game_ns - usual))
+            elif variant == "iodisk":
+                grp = [s for s in r["stalls"] if from_stream(s)]
+                h0 = grp[0]["hops"][0] if grp else None
+                on_io = bool(h0) and h0["cause"] == "block_io"
+                yes("a wait ended by mg_stream, which was blocked on I/O", on_io)
+                yes("... ending at an interrupt",
+                    on_io and len(grp[0]["hops"]) > 1 and is_irq(grp[0]["hops"][1]))
+                yes("that group is top-ranked, by total", top and from_stream(top))
+                yes("... ranked by stall time", top_st and from_stream(top_st))
+                yes("anything in the record names bgio", names(r, "bgio"))
+                if on_io and game_ns:
+                    amounts.append(h0["ns"] / game_ns)
             elif variant == "cpuspike":
                 run_extra = c["oncpu"] - usual_c.get("oncpu", 0)
                 st_top = stall_time(top_st) if top_st else 0
@@ -222,7 +279,8 @@ def main():
                     "memthp": "memory time / the game's own walk time",
                     "slack": "timer group / the game's own limiter time",
                     "ipc": "server group's inherited time / the game's extra call time",
-                    "cpuspike": "extra running time / the game's own burn time"}[variant]
+                    "cpuspike": "extra running time / the game's own burn time",
+                    "iodisk": "the streamer's I/O in the chain / the game's own load time"}[variant]
             print(f"    {what + ':':62}median {100 * med(amounts):.0f}%")
         if counts:
             print(f"    {'waits in that group:':62}median {med(counts):.0f}")
