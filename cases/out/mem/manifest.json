@@ -1,0 +1,12 @@
+{"variant": "mem", "seconds": 45, "date": "2026-10-07T13:37:47+09:00",
+ "kernel": "7.0.0-38-generic", "cpus_online": 10,
+ "game_cpus": "0-3", "game_args": "-w 3 -n 120 -m 512 -g 2 -e 30", "budget_us": 20833,
+ "bgload": {"threads": 4, "period_ms": 700, "burst_ms": 20},
+ "asset": {"mb": 8, "every_frames": 30},
+ "memory": {"world_mb": 512, "walk_mb": 2, "max": "420M"},
+ "slack_ns": 8000000, "server_cpu": "5", "ipc_calls": 30,
+ "burn_ms": 12,
+ "hitchtrace_args": "-U",
+ "vulkan_device": "llvmpipe (LLVM 20.1.2, 256 bits)",
+ "mesa": "Mesa 25.2.8-0ubuntu0.24.04.4 (LLVM 20.1.2)",
+ "hitchtrace_commit": "6584ef9-dirty"}

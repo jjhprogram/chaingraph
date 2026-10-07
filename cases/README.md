@@ -19,7 +19,52 @@ around one unmodified workload, and asks whether a hitchtrace record alone expla
 make && make layer layer-install && make -C cases
 cases/run.sh bgcpu 60 bgcpu-confirm
 python3 cases/analyze_bgcpu.py cases/out/bgcpu-confirm
+tools/hitchview.py cases/out/bgcpu-confirm/hitch.jsonl    # writes hitch.html: one page, every hitch
 ```
+
+`tools/hitchview.py` turns any hitchtrace JSONL file into a self-contained HTML page: every hitch of
+the run on a strip, and for the selected frame its **timeline** (one lane per thread, every off-CPU
+interval at its real time, an arrow from whichever thread ended a wait), where its thread's time
+went, each stall group with its wakeup chain, and the other threads' totals on the same scale.
+
+## The per-frame timeline
+
+A hitch record used to hold only sums and chains. It now also carries the frame's raw off-CPU
+intervals (`events` in the JSON): for every thread of the process, when it left the CPU, when it was
+woken, when it ran again, why it waited, and who woke or preempted it.
+
+- **How.** While a frame is open, each interval is appended to a per-frame buffer as it ends. At the
+  frame mark, a frame over budget has its buffer sent right after its record; any other frame's
+  buffer is discarded. Frames within budget still emit nothing. `--no-timeline` turns it off.
+- **Checked against the totals.** The intervals and the per-thread totals come from different paths
+  in the BPF program, so `tests/check_timeline.py` compares them: clipped to the frame, a thread's
+  intervals must add up to its buckets. On the three game runs (`out/*-timeline`) and a full
+  hitchbench run, every one of 2,294 and 511 thread lines agrees to within 50 µs. Five waits ended
+  while their frame was being closed; the record calls those "still waiting at frame end" and the
+  timeline has the finished interval.
+- **Cost.** 72 bytes per interval: a median 16–22 intervals per hitch in the game (about 1.5 KB on
+  top of the 10.3 KB record), 37 in hitchbench's `thousand_cuts`. Two 147 KB buffers of kernel memory.
+  Interleaved A/B on the game (3 × 12 s per arm): job phase a median 9.3 ms untraced, 8.6 ms traced
+  with `--no-timeline`, 9.0 ms with the timeline on, so no measurable slowdown on this VM.
+- **Limits.** Threads of the traced process only: a waker in another process appears by name, with how
+  long it was itself off-CPU during the wait, but has no lane. At most 2,048 intervals per frame; a
+  record says how many did not fit. Time running in the kernel (page faults, reclaim) is not on the
+  timeline, only in the buckets.
+
+## Summary
+
+| Case | What happens | Explanation in the record | Right amount | Ranked first (total / stall time) | What it cannot say |
+|---|---|---|---|---|---|
+| 1 `bgcpu` | a background app takes the game's cores | 99% | 100% of the worker's delay | on top (one long wait) | names only the last preemptor |
+| 2 `iomain`, `iothread` | a frame waits on a disk read | 100% | 91–94% | 66–71% / 81–88% | why the disk was slow |
+| 3 `mem`, `memthp` | walking memory that was swapped out | 99–100% | 95–96% | 33–60% / 99–100% | which pressure caused the swapping |
+| 4 `slack` | the frame limiter's sleep ends late | sees the sleep | 99% | 0% | **that the sleep was late** |
+| 5 `ipc` | calls to a server that cannot get its CPU | 100% | 105% | 8% / 98% | **who had the server's CPU** |
+| 6 `cpuspike` | CPU work in the game (negative control) | "running", 100% | 99% | blames no stall in 91% | where the CPU time went |
+
+"Stall time" is a ranking replayed on the same records: a wait on a thread that was itself running
+does not count, and neither does a timer sleep. No case produced a false explanation in its noise
+frames, with one qualification in case 5.
 
 All results below are from the development VM (Hyper-V, 10 vCPUs, lavapipe software Vulkan). Its
 timing is noisy: with nothing injected, 2–6% of frames run long, and the noise level drifts between
@@ -311,4 +356,115 @@ workers are both futex waits; the baseline has to be per group. The same baselin
   in all three. The 14–16 ms medians in the two case runs are this VM's disk being slower at the time.
 - A waker delayed 0.2 ms in an 8.4 ms wait is printed as "kept off the CPU 0.2 ms". True, but the
   wording gives it more weight than the 8.2 ms it spent running.
+
+## Case 3: walking memory that was swapped out (`mem`, `memthp`)
+
+**What it models.** `cases.md` category B, the memory-tuning folklore: a game that runs well until
+memory is tight. The game keeps a 512 MB world in memory and, every 30th frame, walks 2 MB of it
+(reads and writes every page), as on entering an area whose data has not been touched for a while. It
+runs in a cgroup limited to 420 MB (`systemd-run --user --scope -p MemoryMax=420M`), so part of the
+world is always in swap and the walk faults it back in. `memthp` asks for transparent huge pages for
+the world (`MADV_HUGEPAGE`). Ground truth is the game's log: which frames walked, how long the walk
+took, and the main thread's own page-fault counts from `getrusage`.
+
+Without the limit the walk takes 0.1 ms. With it, a median 18 ms, with 64 major and 448 minor faults.
+
+| From one record | `mem`: walk frames (81) | `memthp`: walk frames (83) | Noise (38, 39) |
+|---|---|---|---|
+| Has an I/O group whose kernel stack is a page fault | 80 (99%) | 83 (100%) | 0 |
+| Memory (fault buckets + that I/O) is ≥ half the overrun | 81 (100%) | 83 (100%) | 0 |
+| Memory time / the game's own walk time, median | 95% | 96% | |
+| The group's wait count equals the game's major-fault count (±2) | 80 (99%) | 83 (100%) | |
+| That group is top-ranked by total | 27 (33%) | 50 (60%) | 0 |
+| … by stall time | 80 (99%) | 83 (100%) | 0 |
+| … under the old rule (longest single wait) | 12 (15%) | 7 (8%) | 0 |
+
+The record reads: 64 waits on I/O, none longer than about 0.7 ms, 13–18 ms in all, blocked in
+
+```
+io_schedule <- folio_wait_bit_common <- do_swap_page <- handle_mm_fault <- exc_page_fault
+```
+
+which is a page fault waiting for a page to come back from swap, plus about 3 ms of on-CPU time
+inside major faults. The count matching the kernel's own major-fault counter, frame by frame, is a
+second independent check that the grouping is right.
+
+- **This is the case grouping was built for.** No single wait stands out, so the old rule picked the
+  swap-in in 8–15% of frames. Summed, it is the largest stall in every one.
+- **Huge pages made no difference here.** Same fault counts with and without them: pages come back
+  from swap one small page at a time. This is one data point under one kind of pressure, not a
+  verdict on the THP advice in `cases.md`.
+- **The record says "swap-in", not why memory was tight.** It cannot see the limit, or who else used
+  the memory. No reclaim time showed up on the main thread.
+
+## Case 4: the frame limiter's sleep ends late (`slack`)
+
+**What it models.** `cases.md` F2, the Linux 7.0 clockevents regression: timers delivered late, so a
+frame limiter oversleeps. A preloaded library (`slack.so`) wraps `clock_nanosleep` in the unmodified
+game and, for 400 ms in every 1.5 s, raises the thread's timer slack to 8 ms before the sleep. (Another
+process may not set a thread's timer slack, so this has to run inside the game.) Ground truth is the
+library's log of the affected sleeps, and the game's own measure of how late each sleep ended.
+
+In affected frames the sleep ended a median 8.1 ms late and 98% went over budget.
+
+| From one record | Affected frames (244) | Noise (29) |
+|---|---|---|
+| Timer group / the game's own limiter time, median | 99% | 99% |
+| The timer sleep is top-ranked by total | 0 | 0 |
+| The record has a field saying the sleep ended late | **0** | 0 |
+
+**hitchtrace cannot explain this hitch.** It measures the sleep exactly (9.5 ms against a usual 6),
+but a sleep that was asked to be 6 ms and took 14 looks the same as one asked to be 14. The timeline
+shows a longer pink bar and nothing else. The stall-time ranking, which ignores timer sleeps, is blind
+to it by construction. This is the gap `cases.md` predicted, now measured: hitchtrace has to record
+how long a sleep **asked for**, and report the overshoot.
+
+## Case 5: calls to a server that cannot get its CPU (`ipc`)
+
+**What it models.** `cases.md` D1 and the "wineserver round-trips" example: a game thread that makes
+many blocking calls per frame to another process. `ipcserver` stands in for wineserver, pinned to
+CPU 5; the game's main thread makes 30 request/reply calls to it every frame. `bgload` bursts on CPU 5
+only (4 threads, 25 ms every 700 ms), so the game's own cores are untouched and only the server is
+delayed. Ground truth is `bgload`'s burst log.
+
+Normally the 30 calls take 2.8 ms. During a burst, a median 9.2 ms, and 81% of those frames go over.
+
+| From one record | Burst frames (233) | Noise (41) |
+|---|---|---|
+| Has a group of waits ended by `mg_server` | 233 (100%) | 41 (100%) |
+| … saying the server was kept off the CPU | 232 (100%) | 27 (66%) |
+| … and naming `bgload` | **0** | 0 |
+| The group's inherited time / the game's extra call time, median | 105% | |
+| That group is top-ranked by total | 19 (8%) | 0 |
+| … by stall time | 228 (98%) | 16 (39%) |
+| … under the old rule | 0 | 0 |
+
+The chain crosses the process boundary correctly: 30 waits, ended by a thread of another process,
+which was itself kept off the CPU for the right amount of time. Two things fall short.
+
+- **It cannot say who had the server's CPU.** The server was not preempted. It was asleep, was woken
+  by the game's request, and then waited in the run queue behind `bgload`. hitchtrace records who
+  takes a CPU *from* a running thread, not who is occupying it when a woken thread wants it. This is
+  the second gap `cases.md` predicted (the run-queue occupant).
+- **The noise frames show the same group, smaller.** Every call costs the server's wake-up latency, so
+  even an untroubled frame has 1–2 ms of "server kept off the CPU". In a frame that is over budget by
+  1 ms for another reason, that is enough to rank first by stall time (39% of noise frames). It is
+  real time, and removing it would have saved the frame, but it is not what made that frame
+  different. The server has no lane on the timeline: only the game's process is logged.
+
+## Case 6: CPU work in the game (`cpuspike`), a negative control
+
+**What it models.** The most famous stutter in `cases.md`, shader compilation, and any spike of the
+game's own: every 30th frame the main thread burns 12 ms of CPU. hitchtrace should not blame a stall.
+
+| From one record | Spike frames (86) |
+|---|---|
+| Running is ≥ half the overrun | 86 (100%) |
+| Extra running time / the game's own burn time, median | 99% |
+| No stall worth a quarter of the overrun | 78 (91%) |
+
+The record says "the main thread was running 12 ms more than usual", which is the right answer and
+the signal to switch to a CPU profiler. It cannot say what the thread was running: stacks are taken
+when a thread leaves the CPU, not while it runs. In the other 9% an unrelated stall of some size
+happened in the same frame.
 

@@ -1,0 +1,4 @@
+Tracing frames of PID 4918 (marker hitch_frame_mark, budget 20.8 ms)... for 45 seconds, or hit Ctrl-C to end.
+stats: frames=2554 hitches=274 emitted=274 ringbuf-full=0 stalls=10333 resolved=2734 unresolved=5289 storage-fail=1 stack-err=0 slots-full=0
+2554 frames, 274 hitches (10.7%), 274 records
+warning: task storage unavailable for 1 events; their time is unaccounted

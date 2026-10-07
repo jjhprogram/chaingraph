@@ -1,0 +1,3 @@
+Tracing frames of PID 12905 (marker hitch_frame_mark, budget 20.8 ms)... for 40 seconds, or hit Ctrl-C to end.
+stats: frames=2378 hitches=112 emitted=112 ringbuf-full=0 stalls=10289 resolved=3991 unresolved=3262 storage-fail=0 stack-err=0 slots-full=0
+2378 frames, 112 hitches (4.7%), 112 records

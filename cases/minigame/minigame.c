@@ -46,8 +46,23 @@
  * for assets that are not in the page cache, which is every asset the first
  * time, without needing root to drop caches between runs.
  *
+ * Three more things a game does, each off unless asked for. The first two
+ * happen on the same frames as an asset load, one frame in every -e:
+ *
+ *	-m MB [-g MB] [-H]	keep a world of MB megabytes in memory and
+ *		walk -g megabytes of it on those frames, as on entering an
+ *		area whose data has not been used for a while. -H asks for
+ *		transparent huge pages for it. Under a memory limit the walk
+ *		faults pages back in from swap.
+ *	-b MS	burn MS milliseconds of CPU on the main thread on those
+ *		frames: a shader compile, a script, a spike of the game's own.
+ *	-i SOCKET [-c N]	make N blocking request/reply calls per frame to
+ *		a server process listening on SOCKET (cases/ipcserver.c), as a
+ *		game under Wine does to wineserver.
+ *
  * usage: minigame [-d SECONDS] [-w WORKERS] [-f FPS] [-n OBJECTS]
- *                 [-t TILES] [-s main|thread -p PACK [-a MB] [-e FRAMES]]
+ *                 [-t TILES] [-s main|thread -p PACK [-a MB]] [-e FRAMES]
+ *                 [-m MB [-g MB] [-H]] [-b MS] [-i SOCKET [-c N]]
  *                 [-o FRAMELOG] [-h]
  */
 #define _GNU_SOURCE
@@ -61,7 +76,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -88,6 +107,9 @@ static int opt_stream = STREAM_OFF;
 static const char *opt_pack;
 static int opt_asset_mb = 8;
 static int opt_every = 20;
+static int opt_world_mb, opt_touch_mb = 16, opt_burn_ms, opt_calls = 30;
+static bool opt_thp;
+static const char *opt_sock;
 
 static void die(const char *fmt, ...)
 {
@@ -353,6 +375,95 @@ static void asset_step(void)
 			pthread_cond_wait(&s_ready, &s_lock);
 		pthread_mutex_unlock(&s_lock);
 	}
+}
+
+/* ------------------------------------------------------- the game's world */
+
+static unsigned char *world;
+static size_t world_bytes, world_pos;
+static volatile uint32_t world_sum;
+
+/* A world's worth of data, written once so that every page of it exists. */
+static void world_init(void)
+{
+	uint64_t x = 0x9e3779b97f4a7c15ull;
+	size_t i;
+
+	world_bytes = (size_t)opt_world_mb << 20;
+	world = mmap(NULL, world_bytes, PROT_READ | PROT_WRITE,
+		     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (world == MAP_FAILED)
+		die("cannot allocate a %d MB world: %s", opt_world_mb, strerror(errno));
+	madvise(world, world_bytes, opt_thp ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+	/* not zeroes and not a repeated pattern: nothing for the kernel to fold */
+	for (i = 0; i + 8 <= world_bytes; i += 8) {
+		x ^= x << 13;
+		x ^= x >> 7;
+		x ^= x << 17;
+		memcpy(world + i, &x, 8);
+	}
+}
+
+/* Walk the next part of the world, reading and writing every page of it. */
+static void world_touch(void)
+{
+	size_t n = (size_t)opt_touch_mb << 20, k;
+	uint32_t sum = 0;
+
+	if (n > world_bytes)
+		n = world_bytes;
+	for (k = 0; k < n; k += 4096) {
+		unsigned char *p = world + (world_pos + k) % world_bytes;
+
+		sum += p[0];
+		p[1]++;
+	}
+	world_pos = (world_pos + n) % world_bytes;
+	world_sum = sum;
+}
+
+/* Burn @ms of this thread's CPU time, however long that takes on the wall. */
+static void burn_cpu(int ms)
+{
+	struct timespec c0, c;
+	volatile uint64_t sink = 0;
+	int k;
+
+	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
+	do {
+		for (k = 0; k < 20000; k++)
+			sink += k * 2654435761u;
+		clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c);
+	} while ((c.tv_sec - c0.tv_sec) * 1000000000ll + c.tv_nsec - c0.tv_nsec <
+		 ms * 1000000ll);
+}
+
+/* ------------------------------------------------------ calls to a server */
+
+static int srv_fd = -1;
+
+static void server_connect(void)
+{
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+
+	if (strlen(opt_sock) >= sizeof(addr.sun_path))
+		die("socket path too long");
+	strcpy(addr.sun_path, opt_sock);
+	srv_fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+	if (srv_fd < 0 || connect(srv_fd, (struct sockaddr *)&addr, sizeof(addr)))
+		die("cannot connect to the server at %s: %s", opt_sock, strerror(errno));
+}
+
+/* One frame's worth of blocking calls: ask, and wait for the answer. */
+static void server_calls(void)
+{
+	char msg[64] = "call";
+	int i;
+
+	for (i = 0; i < opt_calls; i++)
+		if (write(srv_fd, msg, sizeof(msg)) != sizeof(msg) ||
+		    read(srv_fd, msg, sizeof(msg)) != sizeof(msg))
+			die("the server went away: %s", strerror(errno));
 }
 
 /* ---------------------------------------------------------------- vulkan */
@@ -680,14 +791,19 @@ struct frame_log {
 	uint64_t t_end_ns;	/* present entry that closed this frame */
 	uint64_t frame_ns, present_ns, limiter_ns, sim_ns, asset_ns, jobs_ns,
 		 upload_ns;
+	uint64_t late_ns;	/* the limiter's sleep ended this long after it asked */
+	uint64_t calls_ns, touch_ns, burn_ns;
+	long majflt, minflt;	/* the main thread's page faults in the frame */
 	bool asset;		/* this frame loaded one */
+	bool step;		/* this is one frame in every -e */
 };
 
 static void usage(void)
 {
 	fprintf(stderr,
 		"usage: minigame [-d SECONDS] [-w WORKERS] [-f FPS] [-n OBJECTS]\n"
-		"                [-t TILES] [-s main|thread -p PACK [-a MB] [-e FRAMES]]\n"
+		"                [-t TILES] [-s main|thread -p PACK [-a MB]] [-e FRAMES]\n"
+		"                [-m MB [-g MB] [-H]] [-b MS] [-i SOCKET [-c N]]\n"
 		"                [-o FRAMELOG]\n");
 	exit(2);
 }
@@ -697,12 +813,13 @@ int main(int argc, char **argv)
 	pthread_t workers[MAX_WORKERS], stream_thread;
 	struct frame_log *log, cur = { 0 };
 	uint64_t period, t_stop, deadline, t_prev_present = 0, t0, t1, nframe = 0;
+	struct rusage ru, ru_prev;
 	size_t nlog = 0, caplog;
 	uint32_t idx;
 	long i;
 	int c;
 
-	while ((c = getopt(argc, argv, "d:w:f:n:t:s:p:a:e:o:h")) != -1) {
+	while ((c = getopt(argc, argv, "d:w:f:n:t:s:p:a:e:m:g:Hb:i:c:o:h")) != -1) {
 		switch (c) {
 		case 'd': opt_duration = atoi(optarg); break;
 		case 'w': opt_workers = atoi(optarg); break;
@@ -713,6 +830,12 @@ int main(int argc, char **argv)
 		case 'p': opt_pack = optarg; break;
 		case 'a': opt_asset_mb = atoi(optarg); break;
 		case 'e': opt_every = atoi(optarg); break;
+		case 'm': opt_world_mb = atoi(optarg); break;
+		case 'g': opt_touch_mb = atoi(optarg); break;
+		case 'H': opt_thp = true; break;
+		case 'b': opt_burn_ms = atoi(optarg); break;
+		case 'i': opt_sock = optarg; break;
+		case 'c': opt_calls = atoi(optarg); break;
 		case 's':
 			if (!strcmp(optarg, "main"))
 				opt_stream = STREAM_MAIN;
@@ -728,7 +851,8 @@ int main(int argc, char **argv)
 	    opt_objects < 1 || opt_objects > MAX_OBJECTS ||
 	    opt_tiles < 1 || opt_tiles > MAX_TILES || opt_duration < 1 ||
 	    (opt_stream != STREAM_OFF) != (opt_pack != NULL) ||
-	    opt_asset_mb < 1 || opt_every < 1)
+	    opt_asset_mb < 1 || opt_every < 1 || opt_world_mb < 0 ||
+	    opt_touch_mb < 1 || opt_burn_ms < 0 || opt_calls < 1)
 		usage();
 
 	pthread_setname_np(pthread_self(), "mg_main");
@@ -740,6 +864,10 @@ int main(int argc, char **argv)
 	game_init();
 	if (opt_stream != STREAM_OFF)
 		stream_open();
+	if (opt_world_mb)
+		world_init();
+	if (opt_sock)
+		server_connect();
 	if (opt_stream == STREAM_THREAD &&
 	    pthread_create(&stream_thread, NULL, streamer, NULL))
 		die("cannot start the streamer");
@@ -754,21 +882,27 @@ int main(int argc, char **argv)
 		die("out of memory");
 
 	fprintf(stderr, "minigame pid=%d %ux%u workers=%d tiles=%d objects=%d "
-		"cap=%d fps duration=%d s stream=%s\n", getpid(), fb_w, fb_h,
+		"cap=%d fps duration=%d s stream=%s world=%d MB%s burn=%d ms "
+		"calls=%d\n", getpid(), fb_w, fb_h,
 		opt_workers, opt_tiles, opt_objects, opt_fps, opt_duration,
 		opt_stream == STREAM_MAIN ? "main" :
-		opt_stream == STREAM_THREAD ? "thread" : "off");
+		opt_stream == STREAM_THREAD ? "thread" : "off", opt_world_mb,
+		opt_thp ? " (huge pages)" : "", opt_burn_ms, opt_sock ? opt_calls : 0);
 
+	getrusage(RUSAGE_THREAD, &ru_prev);
 	deadline = now_ns();
 	t_stop = deadline + (uint64_t)opt_duration * NSEC;
 	while (now_ns() < t_stop) {
 		/* limiter: an absolute grid, restarted after an overrun */
 		t0 = now_ns();
 		deadline += period;
-		if (deadline < t0)
+		cur.late_ns = 0;
+		if (deadline < t0) {
 			deadline = t0;
-		else
+		} else {
 			sleep_until(deadline);
+			cur.late_ns = now_ns() - deadline;
+		}
 		t1 = now_ns();
 		cur.limiter_ns = t1 - t0;
 
@@ -777,11 +911,27 @@ int main(int argc, char **argv)
 		t0 = now_ns();
 		cur.sim_ns = t0 - t1;
 
-		cur.asset = opt_stream != STREAM_OFF && ++nframe % opt_every == 0;
+		if (opt_sock)
+			server_calls();
+		t1 = now_ns();
+		cur.calls_ns = t1 - t0;
+		t0 = t1;
+
+		/* one frame in every -e: whatever crossing into a new area costs */
+		cur.step = ++nframe % opt_every == 0;
+		cur.asset = cur.step && opt_stream != STREAM_OFF;
 		if (cur.asset)
 			asset_step();
 		t1 = now_ns();
 		cur.asset_ns = t1 - t0;
+		if (cur.step && opt_world_mb)
+			world_touch();
+		t0 = now_ns();
+		cur.touch_ns = t0 - t1;
+		if (cur.step && opt_burn_ms)
+			burn_cpu(opt_burn_ms);
+		t1 = now_ns();
+		cur.burn_ns = t1 - t0;
 		t0 = t1;
 
 		run_jobs();
@@ -791,6 +941,11 @@ int main(int argc, char **argv)
 		idx = upload_frame();
 		t0 = now_ns();
 		cur.upload_ns = t0 - t1;
+
+		getrusage(RUSAGE_THREAD, &ru);
+		cur.majflt = ru.ru_majflt - ru_prev.ru_majflt;
+		cur.minflt = ru.ru_minflt - ru_prev.ru_minflt;
+		ru_prev = ru;
 
 		/* present entry: this frame ends, the next begins */
 		if (t_prev_present && nlog < caplog) {
@@ -828,7 +983,9 @@ int main(int argc, char **argv)
 			fprintf(f, "{\"frame\":%zu,\"t_end_ns\":%llu,\"frame_us\":%llu,"
 				"\"present_us\":%llu,\"limiter_us\":%llu,\"sim_us\":%llu,"
 				"\"asset\":%d,\"asset_us\":%llu,\"jobs_us\":%llu,"
-				"\"upload_us\":%llu}\n", k,
+				"\"upload_us\":%llu,\"step\":%d,\"late_us\":%llu,"
+				"\"calls_us\":%llu,\"touch_us\":%llu,\"burn_us\":%llu,"
+				"\"majflt\":%ld,\"minflt\":%ld}\n", k,
 				(unsigned long long)log[k].t_end_ns,
 				(unsigned long long)log[k].frame_ns / 1000,
 				(unsigned long long)log[k].present_ns / 1000,
@@ -837,7 +994,13 @@ int main(int argc, char **argv)
 				log[k].asset,
 				(unsigned long long)log[k].asset_ns / 1000,
 				(unsigned long long)log[k].jobs_ns / 1000,
-				(unsigned long long)log[k].upload_ns / 1000);
+				(unsigned long long)log[k].upload_ns / 1000,
+				log[k].step,
+				(unsigned long long)log[k].late_ns / 1000,
+				(unsigned long long)log[k].calls_ns / 1000,
+				(unsigned long long)log[k].touch_ns / 1000,
+				(unsigned long long)log[k].burn_ns / 1000,
+				log[k].majflt, log[k].minflt);
 		fclose(f);
 	}
 	fprintf(stderr, "minigame: %zu frames\n", nlog);

@@ -1,0 +1,1 @@
+ipcserver pid=5142 socket=/home/asdf/ebpf/cases/out/ipc/srv.sock work=20 us

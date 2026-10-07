@@ -1,0 +1,3 @@
+Tracing frames of PID 5146 (marker hitch_frame_mark, budget 20.8 ms)... for 45 seconds, or hit Ctrl-C to end.
+stats: frames=2471 hitches=274 emitted=274 ringbuf-full=0 stalls=82945 resolved=7290 unresolved=74892 storage-fail=0 stack-err=0 slots-full=0
+2471 frames, 274 hitches (11.1%), 274 records
